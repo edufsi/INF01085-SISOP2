@@ -1,13 +1,15 @@
 import socket
 from datetime import datetime
 
-from .state import ServerState
+from state import ServerState
 
 
 def handle_descoberta(socket_servidor: socket.socket, endereco_cliente: tuple[str, int], state: ServerState) -> None:
     if endereco_cliente not in state.estado_clientes:
         state.estado_clientes[endereco_cliente] = 1
 
+    # Especificação não diz nada sobre o que responder para o cliente, 
+    # então respondendo aqui com uma mensagem simples
     socket_servidor.sendto("IP_SERVIDOR_OK".encode("utf-8"), endereco_cliente)
 
 
@@ -19,8 +21,13 @@ def handle_processamento(
 ) -> None:
     try:
         id_recebido, valor_soma = map(int, mensagem.split(","))
+
+        # estado_clientes: dict[tuple[str, int], int]
+        # Mapeia o endereço do cliente (IP, porta) para o próximo ID de requisição esperado desse cliente.
+        # Ainda tá faltando aqui guardar também o valor da última soma processada
         id_esperado = state.estado_clientes.get(endereco_cliente, 1)
 
+        # Tudo certo
         if id_recebido == id_esperado:
             state.num_requisicoes_total += 1
             state.acumulador_global += valor_soma
@@ -31,11 +38,15 @@ def handle_processamento(
             )
             state.estado_clientes[endereco_cliente] = id_esperado + 1
             ultimo_processado = id_recebido
+        
+        # Requisição duplicada (provavelmente um ACK perdido)
         elif id_recebido < id_esperado:
             print(f"[Soma] Cliente {endereco_cliente} | ID {id_recebido} duplicado. Ignorando soma.")
 
             # O que eu faço agora? Tenho que repsonder o ACK com o ID do último pacote que processei com sucesso?
             ultimo_processado = id_recebido
+        
+        # Requisição fora de ordem (perdido algum pacote anterior)
         else:
             print(f"[Soma] Cliente {endereco_cliente} | ID {id_recebido} fora de ordem. Esperava {id_esperado}.")
 

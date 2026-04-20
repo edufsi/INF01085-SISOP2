@@ -1,6 +1,6 @@
 import sys
 
-from .interface import iniciar_cliente
+from interface import iniciar_cliente
 
 
 def main() -> None:

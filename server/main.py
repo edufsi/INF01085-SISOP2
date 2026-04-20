@@ -1,6 +1,6 @@
 import sys
 
-from .interface import iniciar_servidor
+from interface import iniciar_servidor
 
 
 def main() -> None:

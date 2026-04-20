@@ -1,8 +1,8 @@
 import socket
 from datetime import datetime
 
-from .processing import handle_descoberta, handle_processamento
-from .state import ServerState
+from processing import handle_descoberta, handle_processamento
+from state import ServerState
 
 
 def iniciar_servidor(porta: int) -> None:

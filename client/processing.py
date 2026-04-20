@@ -21,6 +21,8 @@ def enviar_valor_stop_and_wait(
             dados_ack, _ = cliente.recvfrom(1024)
             msg_ack = dados_ack.decode("utf-8")
 
+            # Padrão da mensagem (ACK,ID_REQUISICAO,NUM_REQS,TOTAL_SUM) tirado do absoluto nada mesmo
+            # A especificação não diz nada sobre os formatos das mensagens 
             if msg_ack.startswith("ACK,"):
                 partes = msg_ack.split(",")
                 id_ack = int(partes[1])
