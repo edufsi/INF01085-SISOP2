@@ -1,4 +1,5 @@
 import socket
+from datetime import datetime
 
 from .processing import handle_descoberta, handle_processamento
 from .state import ServerState
@@ -37,22 +38,11 @@ def iniciar_servidor(porta: int) -> None:
     imediatamente ao reiniciar.
     """
     servidor.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-
-
-    """
-    bind vincula o socket a um endereço específico e porta.
-    O primeiro argumento é uma tupla (IP, Porta). 
-    No nosso caso, usamos '' para o IP, o que significa "todas as interfaces de rede disponíveis".
-    Ou seja, o servidor vai aceitar conexões em qualquer endereço IP que a máquina tenha,
-    e a porta é definida pela constante PORTA (50000).
-    
-    """
     servidor.bind(("", porta))
 
-    print(f"--- Servidor Inicializado (Porta {porta}) ---")
-    print("Aguardando requisições...\n")
-
     state = ServerState()
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"{timestamp} num_reqs {state.num_requisicoes_total} total_sum {state.acumulador_global}")
 
     while True:
         dados, endereco_cliente = servidor.recvfrom(1024)
