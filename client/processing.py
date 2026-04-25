@@ -1,5 +1,4 @@
 import socket
-from datetime import datetime
 
 
 def enviar_valor_stop_and_wait(
@@ -8,7 +7,8 @@ def enviar_valor_stop_and_wait(
     porta_destino: int,
     id_requisicao: int,
     valor_soma: int,
-) -> None:
+) -> tuple[int, int]:
+
     mensagem_envio = f"{id_requisicao},{valor_soma}"
     reconhecido = False
     tentativas = 0
@@ -29,12 +29,6 @@ def enviar_valor_stop_and_wait(
                 if id_ack == id_requisicao:
                     num_reqs = int(partes[2])
                     total_sum = int(partes[3])
-                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    print(
-                        f"{timestamp} server {ip_servidor} id_req {id_requisicao} "
-                        f"value {valor_soma} num_reqs {num_reqs} total_sum {total_sum}"
-                    )
-                    reconhecido = True
+                    return num_reqs, total_sum
         except socket.timeout:
             pass
-

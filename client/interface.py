@@ -6,7 +6,7 @@ from discovery import descobrir_servidor
 from processing import enviar_valor_stop_and_wait
 
 
-def iniciar_cliente(porta_destino: int) -> None:
+def configurar_cliente(porta_destino: int) -> tuple[socket.socket, str]:
     cliente = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     cliente.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
 
@@ -28,6 +28,10 @@ def iniciar_cliente(porta_destino: int) -> None:
         sys.exit(1)
 
     cliente.settimeout(0.01)
+    return cliente, ip_servidor
+
+
+def executar_loop_principal(cliente: socket.socket, ip_servidor: str, porta_destino: int) -> None:
     id_requisicao = 1
 
     # Deveria ter uma thread apenas para escrever as mensagens, e uma thread apenas para ler 
@@ -37,11 +41,23 @@ def iniciar_cliente(porta_destino: int) -> None:
         try:
             entrada = input()
             valor_soma = int(entrada)
-            enviar_valor_stop_and_wait(cliente, ip_servidor, porta_destino, id_requisicao, valor_soma)
+            num_reqs, total_sum = enviar_valor_stop_and_wait(cliente, ip_servidor, porta_destino, id_requisicao, valor_soma)
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            print(
+                f"{timestamp} server {ip_servidor} id_req {id_requisicao} "
+                f"value {valor_soma} num_reqs {num_reqs} total_sum {total_sum}"
+            )
             id_requisicao += 1
         except (KeyboardInterrupt, EOFError):
             break
         except ValueError:
             continue
 
-    cliente.close()
+
+def iniciar_cliente(porta_destino: int) -> None:
+    cliente, ip_servidor = configurar_cliente(porta_destino)
+
+    try:
+        executar_loop_principal(cliente, ip_servidor, porta_destino)
+    finally:
+        cliente.close()
