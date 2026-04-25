@@ -1,9 +1,11 @@
 import re
+import select
 import socket
 import subprocess
+import sys
 import threading
 from datetime import datetime
-from queue import Queue
+from queue import Empty, Queue
 
 from discovery import descobrir_servidor
 from processing import enviar_valor_stop_and_wait
@@ -11,13 +13,18 @@ from processing import enviar_valor_stop_and_wait
 
 def ler_entrada_usuario(input_queue: Queue) -> None:
     while True:
-        try:
-            entrada = input()
-            valor_soma = int(entrada)
-            input_queue.put(valor_soma)
-        except (KeyboardInterrupt, EOFError):
+        pronto, _, _ = select.select([sys.stdin], [], [], 0.1)
+        if not pronto:
+            continue
+
+        linha = sys.stdin.readline()
+        if linha == "":
             input_queue.put(None)
             break
+
+        try:
+            valor_soma = int(linha.strip())
+            input_queue.put(valor_soma)
         except ValueError:
             continue
 
@@ -90,7 +97,9 @@ def executar_loop_principal(
 
     try:
         while True:
+
             valor_soma = input_queue.get()
+
             if valor_soma is None:
                 break
             
@@ -124,8 +133,7 @@ def executar_loop_principal(
                 break 
                 
     except KeyboardInterrupt:
-        pass
-
+        print("\n[!] Interrupção de teclado detectada.")
 
 
 
