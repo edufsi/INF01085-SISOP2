@@ -2,11 +2,17 @@ from dataclasses import dataclass, field
 
 
 @dataclass
+class ClientState:
+    last_req: int = 0
+    last_num_reqs: int = 0
+    last_total_sum: int = 0
+
+
+@dataclass
 class ServerState:
     num_requisicoes_total: int = 0
     acumulador_global: int = 0
 
-    # Mapeia o endereço do cliente (IP, porta) para o próximo ID de requisição esperado desse cliente.
-    # Ainda tá faltando aqui guardar também o valor da última soma processada
-    estado_clientes: dict[tuple[str, int], int] = field(default_factory=dict)
-
+    # Indexamos por string (apenas o IP) porque a especificação descreve o cliente pela estação/endereço IP.
+    # A porta UDP continua disponível em cada recvfrom para responder ao pacote atual, mas não define a identidade lógica do cliente.
+    estado_clientes: dict[str, ClientState] = field(default_factory=dict)
