@@ -23,7 +23,10 @@ def enviar_valor_stop_and_wait(
         tentativas += 1
 
         try:
-            dados_ack, _ = cliente.recvfrom(1024)
+            dados_ack, endereco_ack = cliente.recvfrom(1024)
+            if endereco_ack != (ip_servidor, porta_destino):
+                continue
+
             msg_ack = dados_ack.decode("utf-8")
 
             # Padrão da mensagem (ACK,ID_REQUISICAO,NUM_REQS,TOTAL_SUM) tirado do absoluto nada mesmo
