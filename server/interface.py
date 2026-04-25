@@ -38,6 +38,8 @@ def configurar_servidor(porta: int) -> tuple[socket.socket, ServerState]:
     servidor.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     servidor.bind(("", porta))
 
+    servidor.settimeout(1.0)
+    
     state = ServerState()
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"{timestamp} num_reqs {state.num_requisicoes_total} total_sum {state.acumulador_global}")
@@ -45,14 +47,24 @@ def configurar_servidor(porta: int) -> tuple[socket.socket, ServerState]:
 
 
 def executar_loop_servidor(servidor: socket.socket, state: ServerState) -> None:
-    while True:
-        dados, endereco_cliente = servidor.recvfrom(1024)
-        mensagem = dados.decode("utf-8")
 
-        if mensagem == "DESCOBERTA":
-            handle_descoberta(servidor, endereco_cliente, state)
-        else:
-            handle_processamento(servidor, endereco_cliente, mensagem, state)
+    try:
+        while True:
+            try:
+                dados, endereco_cliente = servidor.recvfrom(1024)
+                mensagem = dados.decode("utf-8")
+
+                if mensagem == "DESCOBERTA":
+                    handle_descoberta(servidor, endereco_cliente, state)
+                else:
+                    handle_processamento(servidor, endereco_cliente, mensagem, state)
+
+            except socket.timeout:
+                pass
+    except KeyboardInterrupt:
+        print("\n[!] Interrupção de teclado detectada.")
+        
+
 
 
 def iniciar_servidor(porta: int) -> None:

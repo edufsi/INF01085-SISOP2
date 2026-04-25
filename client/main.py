@@ -6,8 +6,8 @@ from interface import iniciar_cliente
 def main() -> None:
     if len(sys.argv) != 2:
         print("Uso incorreto!")
-        print("Como usar: python client.py <PORTA_DO_SERVIDOR>")
-        print("Exemplo:   python client.py 50000")
+        print("Como usar: python main.py <PORTA_DO_SERVIDOR>")
+        print("Exemplo:   python main.py 50000")
         sys.exit(1)
 
     try:

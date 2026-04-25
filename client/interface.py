@@ -50,7 +50,9 @@ def calcular_timeout_por_ping(ip_servidor: str, timeout_padrao: float = 0.01) ->
         return timeout_padrao
 
     rtt_medio_ms = float(correspondencia.group(1))
-    return (3 * rtt_medio_ms) / 1000
+
+    timeout_calculado = (3 * rtt_medio_ms) / 1000
+    return max(timeout_calculado, 0.01)
 
 
 def configurar_cliente(porta_destino: int, output_queue: Queue) -> tuple[socket.socket, str]:
@@ -91,23 +93,43 @@ def executar_loop_principal(
             valor_soma = input_queue.get()
             if valor_soma is None:
                 break
+            
+            while True:
+                num_reqs, total_sum = enviar_valor_stop_and_wait(
+                    cliente,
+                    ip_servidor,
+                    porta_destino,
+                    id_requisicao,
+                    valor_soma,
+                    output_queue,
+                )
 
-            num_reqs, total_sum = enviar_valor_stop_and_wait(
-                cliente,
-                ip_servidor,
-                porta_destino,
-                id_requisicao,
-                valor_soma,
-                output_queue,
-            )
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            output_queue.put(
-                f"{timestamp} server {ip_servidor} id_req {id_requisicao} "
-                f"value {valor_soma} num_reqs {num_reqs} total_sum {total_sum}"
-            )
-            id_requisicao += 1
+
+                # Quando a função retorna (-1, -1) é porque recebeu um RESET do servidor, ou seja, o servidor reiniciou e esqueceu o estado de todos os clientes
+                # Neste caso, o cliente precisa resetar seu ID para 1 e tentar enviar a mesma requisição de novo (com o mesmo valor_soma, mas id_requisicao = 1)
+                if num_reqs == -1 and total_sum == -1:
+                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    output_queue.put(f"{timestamp} [Aviso] Servidor reiniciou! Resetando ID para 1...")
+                    id_requisicao = 1
+                                        
+                    continue
+                
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                output_queue.put(
+                    f"{timestamp} server {ip_servidor} id_req {id_requisicao} "
+                    f"value {valor_soma} num_reqs {num_reqs} total_sum {total_sum}"
+                )
+                id_requisicao += 1
+                
+                break 
+                
     except KeyboardInterrupt:
         pass
+
+
+
+
+
 
 
 def iniciar_cliente(porta_destino: int) -> None:

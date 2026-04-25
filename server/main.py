@@ -6,8 +6,8 @@ from interface import iniciar_servidor
 def main() -> None:
     if len(sys.argv) != 2:
         print("Uso incorreto!")
-        print("Como usar: python server.py <PORTA>")
-        print("Exemplo:   python server.py 50000")
+        print("Como usar: python main.py <PORTA>")
+        print("Exemplo:   python main.py 50000")
         sys.exit(1)
 
     try:
