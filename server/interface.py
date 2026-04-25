@@ -5,9 +5,7 @@ from processing import handle_descoberta, handle_processamento
 from state import ServerState
 
 
-def iniciar_servidor(porta: int) -> None:
-
-
+def configurar_servidor(porta: int) -> tuple[socket.socket, ServerState]:
     """
     Cria o socket do servidor.
 
@@ -43,7 +41,10 @@ def iniciar_servidor(porta: int) -> None:
     state = ServerState()
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"{timestamp} num_reqs {state.num_requisicoes_total} total_sum {state.acumulador_global}")
+    return servidor, state
 
+
+def executar_loop_servidor(servidor: socket.socket, state: ServerState) -> None:
     while True:
         dados, endereco_cliente = servidor.recvfrom(1024)
         mensagem = dados.decode("utf-8")
@@ -53,3 +54,11 @@ def iniciar_servidor(porta: int) -> None:
         else:
             handle_processamento(servidor, endereco_cliente, mensagem, state)
 
+
+def iniciar_servidor(porta: int) -> None:
+    servidor, state = configurar_servidor(porta)
+
+    try:
+        executar_loop_servidor(servidor, state)
+    finally:
+        servidor.close()
