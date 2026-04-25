@@ -7,8 +7,8 @@ from state import ClientState, ServerState
 def handle_descoberta(socket_servidor: socket.socket, endereco_cliente: tuple[str, int], state: ServerState) -> None:
     ip_cliente, porta_cliente = endereco_cliente
 
-    if ip_cliente not in state.estado_clientes:
-        state.estado_clientes[ip_cliente] = ClientState()
+    if endereco_cliente not in state.estado_clientes:
+        state.estado_clientes[endereco_cliente] = ClientState()
 
     # Especificação não diz nada sobre o que responder para o cliente, 
     # então respondendo aqui com uma mensagem simples
@@ -25,7 +25,7 @@ def handle_processamento(
         id_recebido, valor_soma = map(int, mensagem.split(","))
         ip_cliente, porta_cliente = endereco_cliente
 
-        client_state = state.estado_clientes.setdefault(ip_cliente, ClientState())
+        client_state = state.estado_clientes.setdefault(endereco_cliente, ClientState())
         id_esperado = client_state.last_req + 1
 
         # Tudo certo

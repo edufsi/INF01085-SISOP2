@@ -13,6 +13,6 @@ class ServerState:
     num_requisicoes_total: int = 0
     acumulador_global: int = 0
 
-    # Indexamos por string (apenas o IP) porque a especificação descreve o cliente pela estação/endereço IP.
-    # A porta UDP continua disponível em cada recvfrom para responder ao pacote atual, mas não define a identidade lógica do cliente.
-    estado_clientes: dict[str, ClientState] = field(default_factory=dict)
+    # Indexamos por (IP, porta) porque o recvfrom já nos entrega esse identificador naturalmente
+    # e isso permite distinguir múltiplos clientes executando na mesma máquina.
+    estado_clientes: dict[tuple[str, int], ClientState] = field(default_factory=dict)
