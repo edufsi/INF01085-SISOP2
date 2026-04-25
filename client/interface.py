@@ -1,4 +1,6 @@
+import re
 import socket
+import subprocess
 import sys
 from datetime import datetime
 
@@ -6,12 +8,34 @@ from discovery import descobrir_servidor
 from processing import enviar_valor_stop_and_wait
 
 
+def calcular_timeout_por_ping(ip_servidor: str, timeout_padrao: float = 0.01) -> float:
+    try:
+        resultado_ping = subprocess.run(
+            ["ping", "-c", "3", "-W", "1", ip_servidor],
+            capture_output=True,
+            check=True,
+            text=True,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return timeout_padrao
+
+    correspondencia = re.search(
+        r"rtt min/avg/max/(?:mdev|stddev) = [0-9.]+/([0-9.]+)/[0-9.]+/[0-9.]+ ms",
+        resultado_ping.stdout,
+    )
+
+    if correspondencia is None:
+        return timeout_padrao
+
+    rtt_medio_ms = float(correspondencia.group(1))
+    return (3 * rtt_medio_ms) / 1000
+
+
 def configurar_cliente(porta_destino: int) -> tuple[socket.socket, str]:
     cliente = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     cliente.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
 
     try:
-        # Não estamos calculando o RTT por ping para definir o timeout, mas é o que devemos fazer no futuro
         ip_servidor = descobrir_servidor(cliente, porta_destino)
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         print(f"{timestamp} server_addr {ip_servidor}")
@@ -27,7 +51,7 @@ def configurar_cliente(porta_destino: int) -> tuple[socket.socket, str]:
         cliente.close()
         sys.exit(1)
 
-    cliente.settimeout(0.01)
+    cliente.settimeout(calcular_timeout_por_ping(ip_servidor))
     return cliente, ip_servidor
 
 
