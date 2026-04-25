@@ -1,3 +1,5 @@
+from datetime import datetime
+from queue import Queue
 import socket
 
 
@@ -7,13 +9,16 @@ def enviar_valor_stop_and_wait(
     porta_destino: int,
     id_requisicao: int,
     valor_soma: int,
+    output_queue: Queue,
 ) -> tuple[int, int]:
 
     mensagem_envio = f"{id_requisicao},{valor_soma}"
-    reconhecido = False
     tentativas = 0
 
-    while not reconhecido:
+    while True:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        tipo_envio = "SEND" if tentativas == 0 else "RESEND"
+        output_queue.put(f"{timestamp} server {ip_servidor} {tipo_envio} id_req {id_requisicao} value {valor_soma}")
         cliente.sendto(mensagem_envio.encode("utf-8"), (ip_servidor, porta_destino))
         tentativas += 1
 

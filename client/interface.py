@@ -92,7 +92,14 @@ def executar_loop_principal(
             if valor_soma is None:
                 break
 
-            num_reqs, total_sum = enviar_valor_stop_and_wait(cliente, ip_servidor, porta_destino, id_requisicao, valor_soma)
+            num_reqs, total_sum = enviar_valor_stop_and_wait(
+                cliente,
+                ip_servidor,
+                porta_destino,
+                id_requisicao,
+                valor_soma,
+                output_queue,
+            )
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             output_queue.put(
                 f"{timestamp} server {ip_servidor} id_req {id_requisicao} "
