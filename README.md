@@ -2,7 +2,8 @@
 
 ## 1. Visão geral da solução
 
-Este trabalho implementa um serviço cliente-servidor sobre o protocolo UDP focado na soma distribuída de inteiros. Como o UDP não oferece garantias de entrega, ordenação ou controle de fluxo nativos, a solução foi projetada com um protocolo de aplicação para garantir um comportamento confiável. A confiabilidade foi garantida através da implementação de um mecanismo Stop-and-Wait com controle de sequência, garantindo tolerância a perdas, duplicatas e reordenação de pacotes.
+Este trabalho implementa um serviço cliente-servidor sobre o protocolo UDP. Como o UDP não oferece confiança, a solução foi projetada com um protocolo de aplicação para garantir um comportamento confiável. A confiabilidade foi implementada com um mecanismo Stop-and-Wait com controle de sequência, garantindo tolerância a perdas, duplicatas e reordenação de pacotes.
+
 
 ## 2. Implementação de cada subserviço
 
@@ -10,24 +11,24 @@ Este trabalho implementa um serviço cliente-servidor sobre o protocolo UDP foca
 
 **Cliente (`client/discovery.py`)**: O cliente utiliza um socket configurado para permitir envio em broadcast (`SO_BROADCAST`). Ele envia a mensagem `DESCOBERTA` para a porta informada e entra em estado de espera bloqueante (com timeout).
 
-**Servidor (`server/processing.py`)**: Ao receber o datagrama de `DESCOBERTA`, o servidor extrai o IP e a porta de origem via `recvfrom` e responde diretamente (unicast) com a mensagem `IP_SERVIDOR_OK`. Neste momento, o servidor registra o novo cliente na estrutura `state.estado_clientes`, justificando-se como a etapa de "handshake" que inicializa o contexto daquele cliente antes do início do processamento.
+**Servidor (`server/processing.py`)**: Ao receber o datagrama de `DESCOBERTA`, o servidor extrai o IP e a porta de origem via `recvfrom` e responde diretamente com a mensagem `IP_SERVIDOR_OK`. Neste momento, o servidor registra o novo cliente na estrutura `state.estado_clientes`.
 
 ### 2.2 Subserviço de processamento
 
-**Cliente (`client/processing.py`)**: Utiliza o protocolo stop-and-wait. A função empacota o envio no formato `id_req,valor`, envia e aguarda o ACK correspondente antes de liberar o próximo envio. A justificativa para o stop-and-wait é a sua simplicidade e eficácia em evitar o congestionamento do servidor, além de facilitar a ordenação.
+**Cliente (`client/processing.py`)**: Utiliza o protocolo stop-and-wait. A função empacota o envio no formato `id_req,valor`, envia e aguarda o ACK correspondente antes de liberar o próximo envio.
 
-**Servidor (`server/processing.py`)**: O servidor atua como uma máquina de estados. Ele valida o `id_req` recebido comparando-o com o próximo ID esperado daquele cliente específico:
+**Servidor (`server/processing.py`)**: O servidor valida o `id_req` recebido comparando ele com o próximo ID esperado daquele cliente específico:
 
-- **Comportamento ideal**: Se o ID é o esperado, processa a soma, atualiza o acumulador global e responde com um ACK atualizado.
-- **Duplicatas**: Se `id < esperado`, trata-se de um pacote duplicado (provavelmente o ACK anterior se perdeu). Nesse caso, reenvia-se o ACK com o último estado válido para destravar o cliente.
+- **Comportamento ideal**: Se o ID é o esperado, processa a soma e responde com um ACK atualizado.
+- **Duplicatas**: Se `id < esperado`, é um pacote duplicado (provavelmente o ACK anterior se perdeu). Nesse caso, reenvia-se o ACK com o último estado válido para destravar o cliente.
 - **Reordenação**: Se `id > esperado`, o pacote chegou fora de ordem. O servidor descarta o processamento e envia um ACK com o último estado conhecido.
-- **Tratamento de falhas (`RESET`)**: Caso o servidor seja reiniciado, ele perde seu estado volátil. Se um cliente desconhecido tentar enviar um pacote com `id > 1`, o servidor não tem o histórico. A justificativa foi implementar uma mensagem de `RESET`, forçando o cliente a reiniciar sua contagem (`id_req = 1`), auto-recuperando o sistema.
+- **(`RESET`)**: Caso o servidor seja reiniciado, ele perde todas as informações dos clientes porque ele não guarda as informações em disco (e nem deve guardar). Por isso, foi desenvolvido um tratamento para este caso. Se um cliente desconhecido tentar enviar um pacote com `id > 1`, o servidor envia uma mensagem de `RESET`, forçando o cliente a reiniciar sua contagem (`id_req = 1`). Então o cliente manda a mensagem novamente com `id_req = 1` e a soma acumulada também será reiniciada a partir da resposta do servidor.
 
 ### 2.3 Subserviço de interface
 
-**Cliente (`client/interface.py`)**: Utiliza um modelo produtor-consumidor com threads separadas para entrada de dados (teclado) e lógica de rede/saída, garantindo que o cliente não bloqueie a leitura de novos inputs do usuário enquanto aguarda um ACK. Os logs exibem timestamps e campos de protocolo para facilitar o debug.
+**Cliente (`client/interface.py`)**: Utiliza threads separadas para entrada de dados (teclado) e lógica de rede/saída, garantindo que o cliente não bloqueie a leitura de novos inputs do usuário enquanto aguarda um ACK. Os logs exibem timestamps e campos de protocolo.
 
-**Servidor (`server/interface.py`)**: Mantém a exibição em tempo real do estado de processamento (`num_reqs` e `total_sum`), além de monitorar e registrar anomalias na rede (duplicatas, fora de ordem).
+**Servidor (`server/interface.py`)**: Mantém a exibição em tempo real do estado de processamento (`num_reqs` e `total_sum`) e de anomalias na rede (duplicatas, fora de ordem).
 
 ## 3. Áreas com necessidade de sincronização de dados
 
@@ -39,7 +40,7 @@ Este trabalho implementa um serviço cliente-servidor sobre o protocolo UDP foca
 
 ### 3.2 Sincronização distribuída (consistência inter-processos)
 
-**Sincronização de estado (cliente <-> servidor)**: Como os processos não compartilham memória e o UDP não garante ordem, foi necessário sincronizar o estado lógico da aplicação. A área de código que garante isso é a validação do `id_requisicao` no cliente com o `id_esperado` no servidor explicada anteriormente. Essa sincronização lógica garante que o servidor só adicione o valor ao `acumulador_global` se houver um consenso temporal de que aquele pacote é, de fato, o próximo da fila.
+**Sincronização de estado (cliente <-> servidor)**: Como os processos não compartilham memória e o UDP não garante ordem, foi necessário sincronizar o estado lógico da aplicação. A área de código que garante isso é a validação do `id_requisicao` no cliente com o `id_esperado` no servidor explicada anteriormente. Essa sincronização lógica garante que o servidor só adicione o valor ao `acumulador_global` se houver um consenso de que aquele pacote é, de fato, o próximo da fila.
 
 ## 4. Principais estruturas e funções implementadas
 
@@ -88,3 +89,32 @@ As primitivas de IPC basearam-se puramente na API de Sockets Berkeley:
 **Problema**: No início, clientes eram identificados apenas pelo endereço IP. No entanto, se o avaliador rodasse múltiplas instâncias do cliente na mesma máquina física (mesmo localhost ou mesma rede NAT), o servidor não conseguiria distinguir as requisições.
 
 **Solução**: O dicionário `estado_clientes` foi refatorado para utilizar a tupla completa `(IP, Porta_Origem)` gerada pelo sistema operacional no `recvfrom` como chave única de identificação. Para manter tudo na especificação de logs exigida, a camada de interface formata as saídas imprimindo apenas o IP.
+
+
+## Tutorial de uso
+
+### Pré-requisitos
+
+- Python 3 instalado.
+- Cliente e servidor na mesma rede local.
+
+### 1. Iniciar o servidor
+
+```bash
+python server\main.py <porta para servidor>
+```
+
+### 2. Iniciar o cliente
+
+```bash
+python client\main.py <porta para o servidor>
+```
+
+### 3. Enviar valores para soma
+
+Com o cliente em execução, digite um inteiro por linha e pressione Enter.  
+
+### 4. Encerrar execução
+
+- Para parar cliente/servidor: `Ctrl + C` em cada terminal.
+- Também é possível encerrar o cliente enviando EOF no terminal (tipicamente Ctrl+Z no Windows ou Ctrl+D no Linux).

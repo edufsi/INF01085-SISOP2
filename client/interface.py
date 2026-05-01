@@ -13,19 +13,19 @@ from processing import enviar_valor_stop_and_wait
 
 def ler_entrada_usuario(input_queue: Queue) -> None:
     while True:
-        pronto, _, _ = select.select([sys.stdin], [], [], 0.1)
-        if not pronto:
-            continue
-
         linha = sys.stdin.readline()
+        
         if linha == "":
             input_queue.put(None)
             break
 
         try:
+            # O strip() remove o '\n' do final antes de converter
             valor_soma = int(linha.strip())
             input_queue.put(valor_soma)
         except ValueError:
+            # Se não for um inteiro válido (ex: letras), apenas ignora 
+            # silenciosamente e volta a aguardar a próxima linha
             continue
 
 
