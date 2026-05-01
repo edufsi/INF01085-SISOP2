@@ -1,6 +1,8 @@
-# Relatório - Parte 1 (Comunicação Confiável Inter-Processos)
+# INF01085 - Relatório do Trabalho Prático 1
 
-## 1. Visão geral da solução
+- Nomes: Eduardo Fonseca da Silva, Estevan Zanetti Küster
+
+## 1. Visão geral
 
 Este trabalho implementa um serviço cliente-servidor sobre o protocolo UDP. Como o UDP não oferece confiança, a solução foi projetada com um protocolo de aplicação para garantir um comportamento confiável. A confiabilidade foi implementada com um mecanismo Stop-and-Wait com controle de sequência, garantindo tolerância a perdas, duplicatas e reordenação de pacotes.
 
