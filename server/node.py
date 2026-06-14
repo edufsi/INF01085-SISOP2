@@ -26,8 +26,9 @@ except ImportError:
     from state import MemberState, ServerState
 
 
-HELLO_INTERVAL = 0.5
+JOIN_HELLO_INTERVAL = 0.5
 HEARTBEAT_INTERVAL = 0.5
+BACKUP_HEARTBEAT_INTERVAL = 0.5
 FAILURE_TIMEOUT = 2.0
 STARTUP_SETTLE = 1.2
 ELECTION_RESPONSE_TIMEOUT = 0.7
@@ -37,8 +38,9 @@ RETRY_INTERVAL = 0.2
 
 @dataclass(frozen=True)
 class NodeTiming:
-    hello_interval: float = HELLO_INTERVAL
+    join_hello_interval: float = JOIN_HELLO_INTERVAL
     heartbeat_interval: float = HEARTBEAT_INTERVAL
+    backup_heartbeat_interval: float = BACKUP_HEARTBEAT_INTERVAL
     failure_timeout: float = FAILURE_TIMEOUT
     startup_settle: float = STARTUP_SETTLE
     election_response_timeout: float = ELECTION_RESPONSE_TIMEOUT
@@ -105,8 +107,10 @@ class ServerNode:
         self.threads: list[threading.Thread] = []
         self.started_at = time.monotonic()
         self.last_leader_heartbeat = self.started_at
-        self.last_hello = 0.0
-        self.last_heartbeat = 0.0
+        self.last_relay_registration = 0.0
+        self.last_join_hello = 0.0
+        self.last_primary_heartbeat = 0.0
+        self.last_backup_heartbeat = 0.0
 
     @staticmethod
     def _local_ip() -> str:
@@ -209,6 +213,7 @@ class ServerNode:
             "SERVER_HELLO": self.handle_server_hello,
             "JOIN_REQUEST": self.handle_join_request,
             "HEARTBEAT": self.handle_heartbeat,
+            "BACKUP_HEARTBEAT": self.handle_backup_heartbeat,
             "REPLICATION": self.handle_replication,
             "REPLICATION_ACK": self.handle_replication_ack,
             "MEMBERSHIP": self.handle_membership,
@@ -231,39 +236,60 @@ class ServerNode:
     def maintenance_loop(self) -> None:
         while self.running.is_set():
             now = time.monotonic()
-            if now - self.last_hello >= self.timing.hello_interval:
-                self.last_hello = now
-                if self.discovery_address is not None:
-                    self.send(
-                        message(
-                            "RELAY_REGISTER",
-                            role="server",
-                            server_id=self.state.server_id,
-                            host=self.state.bind_host,
-                            port=self.state.port,
-                        ),
-                        self.discovery_address,
-                    )
-                with self.state.lock:
-                    hello = self.server_message(
+            if (
+                self.discovery_address is not None
+                and now - self.last_relay_registration
+                >= self.timing.join_hello_interval
+            ):
+                self.last_relay_registration = now
+                self.send(
+                    message(
+                        "RELAY_REGISTER",
+                        role="server",
+                        server_id=self.state.server_id,
+                        host=self.state.bind_host,
+                        port=self.state.port,
+                    ),
+                    self.discovery_address,
+                )
+            with self.state.lock:
+                role = self.state.role
+            if (
+                role == "JOINING"
+                and now - self.last_join_hello >= self.timing.join_hello_interval
+            ):
+                self.last_join_hello = now
+                self.broadcast(
+                    self.server_message(
                         "SERVER_HELLO",
-                        role=self.state.role,
-                        leader_id=self.state.leader_id,
+                        role="JOINING",
                         state_version=self.state.replicated.state_version,
                     )
-                self.broadcast(hello)
-            with self.state.lock:
-                is_primary = self.state.role == "PRIMARY"
+                )
             if (
-                is_primary
-                and now - self.last_heartbeat >= self.timing.heartbeat_interval
+                role == "PRIMARY"
+                and now - self.last_primary_heartbeat
+                >= self.timing.heartbeat_interval
             ):
-                self.last_heartbeat = now
+                self.last_primary_heartbeat = now
                 self.broadcast(
                     self.server_message(
                         "HEARTBEAT",
                         state_version=self.state.replicated.state_version,
                         membership=self.state.membership_payload(),
+                    )
+                )
+            if (
+                role == "BACKUP"
+                and now - self.last_backup_heartbeat
+                >= self.timing.backup_heartbeat_interval
+            ):
+                self.last_backup_heartbeat = now
+                self.broadcast(
+                    self.server_message(
+                        "BACKUP_HEARTBEAT",
+                        leader_id=self.state.leader_id,
+                        state_version=self.state.replicated.state_version,
                     )
                 )
             self.check_startup(now)
@@ -379,14 +405,19 @@ class ServerNode:
                     member = self.state.members.get(server_id)
                     if member is None:
                         return
-                    member.status = "ACTIVE"
-                    self.state.replicated.membership_version += 1
                     self.state.transitioning.clear()
                     address = member.address
                 if not self.send_snapshot(server_id, address):
                     with self.state.lock:
                         self.state.members.pop(server_id, None)
                     return
+                with self.state.lock:
+                    member = self.state.members.get(server_id)
+                    if member is None or self.state.role != "PRIMARY":
+                        return
+                    member.status = "ACTIVE"
+                    member.last_seen = time.monotonic()
+                    self.state.replicated.membership_version += 1
                 self.broadcast_membership()
                 self.log(f"member_active {server_id}")
                 with self.state.lock:
@@ -657,6 +688,7 @@ class ServerNode:
         self, operation: dict[str, Any], backups: list[MemberState]
     ) -> bool:
         version = int(operation["state_version"])
+        operation_term = int(operation["term"])
         pending: dict[int, tuple[threading.Event, tuple[str, int]]] = {}
         for backup in backups:
             event = threading.Event()
@@ -666,7 +698,10 @@ class ServerNode:
         try:
             while pending and self.running.is_set():
                 with self.state.lock:
-                    if self.state.role != "PRIMARY":
+                    if (
+                        self.state.role != "PRIMARY"
+                        or self.state.replicated.election_term != operation_term
+                    ):
                         return False
                     active_ids = {member.server_id for member in self.state.active_members()}
                 for server_id, (event, target) in list(pending.items()):
@@ -702,8 +737,21 @@ class ServerNode:
         self.send(self.server_message("REPLICATION_ACK", state_version=version), address)
 
     def handle_replication_ack(self, payload: dict[str, Any], address: tuple[str, int]) -> None:
-        server_id = self.note_server(payload, address, "ACTIVE")
+        server_id = require_uint64(payload.get("server_id"), "server_id", positive=True)
         version = int(payload["state_version"])
+        incoming_term = int(payload.get("term", 0))
+        with self.state.lock:
+            member = self.state.members.get(server_id)
+            if (
+                self.state.role != "PRIMARY"
+                or incoming_term != self.state.replicated.election_term
+                or member is None
+                or member.status != "ACTIVE"
+            ):
+                return
+            member.host = str(payload.get("host") or address[0])
+            member.port = int(payload.get("port") or address[1])
+            member.last_seen = time.monotonic()
         event = self.pending_replication.get((version, server_id))
         if event is not None:
             event.set()
@@ -759,6 +807,24 @@ class ServerNode:
             self.last_leader_heartbeat = time.monotonic()
         if "membership" in payload and self.state.role != "JOINING":
             self.state.install_membership(payload["membership"], time.monotonic())
+
+    def handle_backup_heartbeat(
+        self, payload: dict[str, Any], address: tuple[str, int]
+    ) -> None:
+        server_id = require_uint64(payload.get("server_id"), "server_id", positive=True)
+        incoming_term = int(payload.get("term", 0))
+        with self.state.lock:
+            member = self.state.members.get(server_id)
+            if (
+                self.state.role != "PRIMARY"
+                or incoming_term != self.state.replicated.election_term
+                or member is None
+                or member.status != "ACTIVE"
+            ):
+                return
+            member.host = str(payload.get("host") or address[0])
+            member.port = int(payload.get("port") or address[1])
+            member.last_seen = time.monotonic()
 
     def start_election(self) -> None:
         if not self.running.is_set() or not self.election_lock.acquire(blocking=False):
@@ -923,11 +989,14 @@ class ServerNode:
                 return
             self.state.replicated.election_term = incoming_term
             self.state.leader_id = leader_id
-            if leader_id != self.state.server_id and self.state.role != "LEAVING":
+            if (
+                leader_id != self.state.server_id
+                and self.state.role not in {"JOINING", "LEAVING"}
+            ):
                 self.state.role = "BACKUP"
             self.last_leader_heartbeat = time.monotonic()
             self.state.transitioning.set()
-        if "membership" in payload:
+        if "membership" in payload and self.state.role != "JOINING":
             self.state.install_membership(payload["membership"], time.monotonic())
         self.coordinator_announced.set()
 

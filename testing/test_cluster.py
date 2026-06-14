@@ -1,9 +1,11 @@
 import socket
+import threading
 import time
 import unittest
 
 from common.protocol import decode, encode, message
 from server.node import ServerNode
+from server.state import MemberState
 
 
 def wait_until(predicate, timeout: float = 8.0) -> None:
@@ -118,6 +120,108 @@ class ClusterIntegrationTests(unittest.TestCase):
         wait_until(lambda: 1 not in fourth.state.members)
         self.assertTrue(fourth.stop(graceful=True))
         wait_until(lambda: second.state.role == "PRIMARY")
+
+    def test_role_specific_heartbeat_traffic(self) -> None:
+        first = self.add_node(1)
+        second = self.add_node(2)
+        third = self.add_node(3)
+        wait_until(
+            lambda: third.state.role == "PRIMARY"
+            and first.state.role == second.state.role == "BACKUP"
+        )
+
+        observed: dict[int, list[str]] = {1: [], 2: [], 3: []}
+        for node in (first, second, third):
+            original_broadcast = node.broadcast
+
+            def record(payload, *, node=node, original_broadcast=original_broadcast):
+                observed[node.state.server_id].append(str(payload["type"]))
+                original_broadcast(payload)
+
+            node.broadcast = record
+
+        time.sleep(0.8)
+
+        self.assertIn("HEARTBEAT", observed[3])
+        self.assertNotIn("SERVER_HELLO", observed[3])
+        self.assertNotIn("BACKUP_HEARTBEAT", observed[3])
+        for server_id in (1, 2):
+            self.assertIn("BACKUP_HEARTBEAT", observed[server_id])
+            self.assertNotIn("SERVER_HELLO", observed[server_id])
+            self.assertNotIn("HEARTBEAT", observed[server_id])
+
+    def test_idle_backup_failure_and_rejoin_require_fresh_join(self) -> None:
+        backup = self.add_node(1)
+        primary = self.add_node(2)
+        wait_until(
+            lambda: primary.state.role == "PRIMARY"
+            and backup.state.role == "BACKUP"
+            and 1 in primary.state.members
+            and primary.state.members[1].status == "ACTIVE"
+        )
+
+        backup.stop(graceful=False, force=True)
+        wait_until(lambda: 1 not in primary.state.members, timeout=5.0)
+
+        primary.handle_backup_heartbeat(
+            message(
+                "BACKUP_HEARTBEAT",
+                server_id=1,
+                host="127.0.0.1",
+                port=backup.state.port,
+                term=primary.state.replicated.election_term,
+                leader_id=2,
+                state_version=backup.state.replicated.state_version,
+            ),
+            backup.state.address,
+        )
+        self.assertNotIn(1, primary.state.members)
+
+        replacement = self.add_node(1)
+        wait_until(
+            lambda: replacement.state.role == "BACKUP"
+            and 1 in primary.state.members
+            and primary.state.members[1].status == "ACTIVE",
+            timeout=10.0,
+        )
+        self.assertEqual(
+            replacement.state.replicated.to_snapshot(),
+            primary.state.replicated.to_snapshot(),
+        )
+
+    def test_replication_stops_when_election_term_changes(self) -> None:
+        primary = self.add_node(1)
+        with primary.state.lock:
+            primary.state.role = "PRIMARY"
+            primary.state.leader_id = 1
+            backup = MemberState(
+                server_id=2,
+                host="127.0.0.1",
+                port=self.base_port + 100,
+                status="ACTIVE",
+                last_seen=time.monotonic(),
+            )
+            primary.state.members[2] = backup
+            operation = primary.server_message(
+                "REPLICATION",
+                state_version=1,
+                client_id="client",
+                request_id=1,
+                value=1,
+            )
+
+        result: list[bool] = []
+        worker = threading.Thread(
+            target=lambda: result.append(primary.replicate_to_all(operation, [backup]))
+        )
+        worker.start()
+        time.sleep(0.1)
+        with primary.state.lock:
+            primary.state.replicated.election_term += 1
+        worker.join(timeout=1.0)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(result, [False])
 
 
 if __name__ == "__main__":

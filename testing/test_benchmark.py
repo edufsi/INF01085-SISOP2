@@ -77,6 +77,18 @@ class BenchmarkTests(unittest.TestCase):
             relay.handle(discovery, client.getsockname())
             forwarded, _ = server.recvfrom(1200)
             self.assertEqual(decode(forwarded), discovery)
+            heartbeat = message(
+                "BACKUP_HEARTBEAT",
+                server_id=10,
+                host=server.getsockname()[0],
+                port=server.getsockname()[1],
+                term=1,
+                leader_id=20,
+                state_version=0,
+            )
+            relay.handle(heartbeat, server.getsockname())
+            forwarded, _ = server.recvfrom(1200)
+            self.assertEqual(decode(forwarded), heartbeat)
             time.sleep(0.03)
             self.assertEqual(relay.active_servers(), [])
         finally:

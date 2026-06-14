@@ -94,6 +94,7 @@ class DiscoveryRelay:
             return
         if message_type.startswith("SERVER_") or message_type in {
             "HEARTBEAT",
+            "BACKUP_HEARTBEAT",
             "MEMBERSHIP",
             "COORDINATOR",
             "LEAVE",
