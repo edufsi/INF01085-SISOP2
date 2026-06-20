@@ -132,13 +132,23 @@ class ClusterIntegrationTests(unittest.TestCase):
 
         observed: dict[int, list[str]] = {1: [], 2: [], 3: []}
         for node in (first, second, third):
+            # Guardamos as duas funções originais
             original_broadcast = node.broadcast
+            original_send = node.send
 
-            def record(payload, *, node=node, original_broadcast=original_broadcast):
+            # Espião do Broadcast (para capturar o HEARTBEAT do Líder)
+            def record_broadcast(payload, *, node=node, original_broadcast=original_broadcast):
                 observed[node.state.server_id].append(str(payload["type"]))
                 original_broadcast(payload)
 
-            node.broadcast = record
+            # Espião do Send (para capturar o BACKUP_HEARTBEAT dos Backups)
+            def record_send(payload, address, *, node=node, original_send=original_send):
+                observed[node.state.server_id].append(str(payload["type"]))
+                original_send(payload, address)
+
+            # Injetamos os dois espiões no nó
+            node.broadcast = record_broadcast
+            node.send = record_send
 
         time.sleep(0.8)
 

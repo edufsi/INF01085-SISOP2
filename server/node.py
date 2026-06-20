@@ -285,13 +285,22 @@ class ServerNode:
                 >= self.timing.backup_heartbeat_interval
             ):
                 self.last_backup_heartbeat = now
-                self.broadcast(
-                    self.server_message(
-                        "BACKUP_HEARTBEAT",
-                        leader_id=self.state.leader_id,
-                        state_version=self.state.replicated.state_version,
-                    )
+                
+                msg = self.server_message(
+                    "BACKUP_HEARTBEAT",
+                    leader_id=self.state.leader_id,
+                    state_version=self.state.replicated.state_version,
                 )
+                
+                # Busca o endereço do líder na lista de membros
+                with self.state.lock:
+                    leader = self.state.members.get(self.state.leader_id)
+                    leader_address = leader.address if leader is not None else None
+                
+                # Se achou o endereço, envia o Unicast direto para ele
+                if leader_address is not None:
+                    self.send(msg, leader_address)
+
             self.check_startup(now)
             self.check_failures(now)
             time.sleep(0.1)
@@ -793,10 +802,42 @@ class ServerNode:
         server_id = self.note_server(payload, address, "ACTIVE")
         if server_id == self.state.server_id:
             return
+            
         incoming_term = int(payload.get("term", 0))
+        incoming_version = int(payload.get("state_version", 0))
+
         with self.state.lock:
+
+            # Ele tem dados velhos, MAS o crachá (Termo) dele é maior ou igual ao nosso.
+            # Se a gente só ignorar, ele nunca vai nos obedecer. 
+            # BAZUCA: Puxa eleição para elevar nosso termo e forçar a atualização dele.
+            if incoming_version < self.state.replicated.state_version and incoming_term >= self.state.replicated.election_term:
+                if self.state.role != "CANDIDATE":
+                    threading.Thread(target=self.start_election, daemon=True).start()
+                return
+                
+            # Ele tem dados velhos e um termo velho. Ele não tem poder nenhum.
+            # Apenas ignora. Não afeta os clientes, porque os clientes estão escolhendo quem tem a versão mais nova
+            # Ele vai ler o nosso próximo Heartbeat e se rebaixar sozinho.
+            if incoming_version < self.state.replicated.state_version:
+                return
+            
+            # Mesmo termo, mesma versão, e ambos acham que são o PRIMARY.
+            # BAZUCA: Força eleição para desempatar usando o server_id.
+            if (
+                incoming_term == self.state.replicated.election_term 
+                and incoming_version == self.state.replicated.state_version
+                and self.state.role == "PRIMARY"
+            ):
+                if self.state.role != "CANDIDATE":
+                    threading.Thread(target=self.start_election, daemon=True).start()
+                return
+            
+            # Regra normal: Termo antigo de eleição passada é ignorado
             if incoming_term < self.state.replicated.election_term:
                 return
+            
+            # Aceita a liderança do chefe legítimo
             self.state.replicated.election_term = incoming_term
             self.state.leader_id = server_id
             if (
@@ -805,6 +846,7 @@ class ServerNode:
             ):
                 self.state.role = "BACKUP" if self.state.role != "JOINING" else "JOINING"
             self.last_leader_heartbeat = time.monotonic()
+            
         if "membership" in payload and self.state.role != "JOINING":
             self.state.install_membership(payload["membership"], time.monotonic())
 
