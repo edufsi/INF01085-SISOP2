@@ -59,6 +59,12 @@ def descobrir_servidor(
     host = resposta_vencedora.get("host")
     port = resposta_vencedora.get("port")
 
-    endereco_final = (str(host), int(port)) if host and port else endereco_vencedor
+    if discovery_address is None:
+        endereco_final = (
+            endereco_vencedor[0],
+            int(port) if port else endereco_vencedor[1],
+        )
+    else:
+        endereco_final = (str(host), int(port)) if host and port else endereco_vencedor
 
     return endereco_final, resposta_vencedora

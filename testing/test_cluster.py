@@ -339,6 +339,51 @@ class ClusterIntegrationTests(unittest.TestCase):
         self.assertEqual(sent[0]["term"], 3)
         self.assertEqual(sent[0]["candidate_id"], 1)
 
+    def test_direct_peer_tracking_prefers_packet_source_over_stale_advertised_host(self) -> None:
+        node = ServerNode(self.base_port + 120, 1, "127.0.0.1")
+        self.nodes.append(node)
+
+        node.note_server(
+            message(
+                "HEARTBEAT",
+                server_id=2,
+                host="10.0.0.5",
+                port=45000,
+                term=1,
+                state_version=0,
+            ),
+            ("10.0.0.99", 45000),
+            "ACTIVE",
+        )
+
+        with node.state.lock:
+            self.assertEqual(node.state.members[2].address, ("10.0.0.99", 45000))
+
+    def test_relay_peer_tracking_keeps_advertised_server_endpoint(self) -> None:
+        node = ServerNode(
+            self.base_port + 130,
+            1,
+            "127.0.0.1",
+            discovery_address=("127.0.0.1", self.base_port + 131),
+        )
+        self.nodes.append(node)
+
+        node.note_server(
+            message(
+                "HEARTBEAT",
+                server_id=2,
+                host="10.0.0.5",
+                port=45000,
+                term=1,
+                state_version=0,
+            ),
+            ("127.0.0.1", self.base_port + 131),
+            "ACTIVE",
+        )
+
+        with node.state.lock:
+            self.assertEqual(node.state.members[2].address, ("10.0.0.5", 45000))
+
 
 if __name__ == "__main__":
     unittest.main()

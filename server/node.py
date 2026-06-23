@@ -348,8 +348,12 @@ class ServerNode:
         if server_id == self.state.server_id:
             return server_id
         now = time.monotonic()
-        host = str(payload.get("host") or address[0])
-        port = int(payload.get("port") or address[1])
+        if self.discovery_address is None:
+            host = address[0]
+            port = address[1]
+        else:
+            host = str(payload.get("host") or address[0])
+            port = int(payload.get("port") or address[1])
         with self.state.lock:
             member = self.state.members.get(server_id)
             if member is None:

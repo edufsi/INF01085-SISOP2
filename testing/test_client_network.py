@@ -3,6 +3,7 @@ from queue import Empty, Queue
 import unittest
 from unittest.mock import patch
 
+from client.discovery import descobrir_servidor
 from client.interface import descobrir_com_retry
 from client.processing import enviar_valor_stop_and_wait
 from common.protocol import decode, encode, message
@@ -98,6 +99,73 @@ class ClientNetworkRecoveryTests(unittest.TestCase):
         messages = self.drain_queue(output_queue)
         self.assertTrue(any("Rede indisponível" in item for item in messages))
         self.assertTrue(any("server_addr 10.0.0.5" in item for item in messages))
+
+    def test_direct_discovery_prefers_packet_source_over_stale_advertised_host(self) -> None:
+        class StaleHostDiscoverySocket:
+            def sendto(self, data: bytes, address: tuple[str, int]) -> int:
+                self.last_discovery = decode(data)
+                self.last_address = address
+                return len(data)
+
+            def settimeout(self, _timeout: float) -> None:
+                pass
+
+            def recvfrom(self, _size: int) -> tuple[bytes, tuple[str, int]]:
+                return (
+                    encode(
+                        message(
+                            "LEADER",
+                            server_id=1,
+                            host="10.0.0.5",
+                            port=45000,
+                            leader_id=1,
+                            state_version=0,
+                        )
+                    ),
+                    ("10.0.0.99", 45000),
+                )
+
+        leader, _ = descobrir_servidor(
+            StaleHostDiscoverySocket(),
+            45000,
+            "client-a",
+        )
+
+        self.assertEqual(leader, ("10.0.0.99", 45000))
+
+    def test_relay_discovery_keeps_advertised_server_endpoint(self) -> None:
+        class RelayDiscoverySocket:
+            def sendto(self, data: bytes, address: tuple[str, int]) -> int:
+                self.last_discovery = decode(data)
+                self.last_address = address
+                return len(data)
+
+            def settimeout(self, _timeout: float) -> None:
+                pass
+
+            def recvfrom(self, _size: int) -> tuple[bytes, tuple[str, int]]:
+                return (
+                    encode(
+                        message(
+                            "LEADER",
+                            server_id=1,
+                            host="10.0.0.5",
+                            port=45000,
+                            leader_id=1,
+                            state_version=0,
+                        )
+                    ),
+                    ("127.0.0.1", 50300),
+                )
+
+        leader, _ = descobrir_servidor(
+            RelayDiscoverySocket(),
+            45000,
+            "client-a",
+            discovery_address=("127.0.0.1", 50300),
+        )
+
+        self.assertEqual(leader, ("10.0.0.5", 45000))
 
     def test_request_send_retries_same_pending_request_after_rediscovery(self) -> None:
         output_queue: Queue = Queue()
