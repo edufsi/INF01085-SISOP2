@@ -798,21 +798,39 @@ class ServerNode:
         self.log(f"client_leave {payload.get('client_id', 'unknown')}")
 
     def handle_primary_conflict(
-        self, incoming_term: int, incoming_leader_id: int, *, coordinator: bool = False
+        self, incoming_term: int, incoming_version: int, incoming_leader_id: int, *, coordinator: bool = False
     ) -> bool:
         with self.state.lock:
-            # Se eu sou BACKUP, JOINING, etc., não é problema meu brigar.
-            # Retorno False para que o handle_heartbeat processe o pacote normalmente.
             if self.state.role != "PRIMARY":
                 return False
 
-        # Se o código chegou aqui, EU sou PRIMARY.
-        # E se chamaram essa função, é porque chegou um pacote de liderança de OUTRA pessoa.
-        # Não importa o termo, não importa a versão. Dispara a eleição imediatamente.
-        threading.Thread(target=self.start_election, daemon=True).start()
-        
-        # Retorna True para interceptar e matar o processamento desse Heartbeat fantasma.
-        return True
+            # 1. O USURPADOR INFLADO (Dados velhos, mas pode ter Termo gigante)
+            if incoming_version < self.state.replicated.state_version:
+                if incoming_term > self.state.replicated.election_term:
+                    self.state.replicated.election_term = incoming_term
+                threading.Thread(target=self.start_election, daemon=True).start()
+                return True
+
+            # 2. NÓS SOMOS OS DESATUALIZADOS
+            if incoming_version > self.state.replicated.state_version:
+                return False 
+
+            # 3. EMPATE DE DADOS (Mesma Versão de Banco)
+            if incoming_version == self.state.replicated.state_version:
+                if incoming_term > self.state.replicated.election_term:
+                    return False 
+                if incoming_term < self.state.replicated.election_term:
+                    return True 
+                    
+                # 4. EMPATE ABSOLUTO (Mesma Versão e Mesmo Termo)
+                # Se for um conflito direto de mensagem "COORDINATOR", o maior ID vence e eu me rendo.
+                if coordinator and incoming_leader_id > self.state.server_id:
+                    return False
+                    
+                threading.Thread(target=self.start_election, daemon=True).start()
+                return True
+                
+        return False
 
     def handle_heartbeat(self, payload: dict[str, Any], address: tuple[str, int]) -> None:
         server_id = self.note_server(payload, address, "ACTIVE")
@@ -820,7 +838,10 @@ class ServerNode:
             return
 
         incoming_term = int(payload.get("term", 0))
-        if self.handle_primary_conflict(incoming_term, server_id):
+        incoming_version = int(payload.get("state_version", 0)) # Puxa a versão
+
+        # Delega a decisão de brigar, passando a versão!
+        if self.handle_primary_conflict(incoming_term, incoming_version, server_id):
             return
 
         with self.state.lock:
@@ -1026,8 +1047,12 @@ class ServerNode:
         leader_id = self.note_server(payload, address, "ACTIVE")
         if leader_id == self.state.server_id:
             return
+            
         incoming_term = int(payload.get("term", 0))
-        if self.handle_primary_conflict(incoming_term, leader_id, coordinator=True):
+        incoming_version = int(payload.get("state_version", 0)) # <--- Extraindo a versão
+        
+        # Agora passamos a versão e a flag do coordenador perfeitamente
+        if self.handle_primary_conflict(incoming_term, incoming_version, leader_id, coordinator=True):
             return
 
         with self.state.lock:
@@ -1042,8 +1067,10 @@ class ServerNode:
                 self.state.role = "BACKUP"
             self.last_leader_heartbeat = time.monotonic()
             self.state.transitioning.set()
+            
         if "membership" in payload and self.state.role != "JOINING":
             self.state.install_membership(payload["membership"], time.monotonic())
+            
         self.coordinator_announced.set()
 
     def handle_server_leave(self, payload: dict[str, Any], address: tuple[str, int]) -> None:
