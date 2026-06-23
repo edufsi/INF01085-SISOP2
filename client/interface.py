@@ -9,9 +9,11 @@ import uuid
 from common.protocol import MAX_UINT64, encode, message
 try:
     from .discovery import descobrir_servidor
+    from .network_errors import is_transient_network_error
     from .processing import LeaderAddress, enviar_valor_stop_and_wait
 except ImportError:
     from discovery import descobrir_servidor
+    from network_errors import is_transient_network_error
     from processing import LeaderAddress, enviar_valor_stop_and_wait
 
 
@@ -68,6 +70,13 @@ def descobrir_com_retry(
             return endereco
         except socket.timeout:
             output_queue.put("[Aviso] Aguardando eleição de um servidor primário...")
+            time.sleep(0.2)
+        except OSError as exc:
+            if not is_transient_network_error(exc):
+                raise
+            output_queue.put(
+                "[Aviso] Rede indisponível; aguardando reconexão ou servidor primário..."
+            )
             time.sleep(0.2)
 
 

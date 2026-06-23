@@ -5,6 +5,10 @@ import time
 from typing import Any, Callable
 
 from common.protocol import ProtocolError, decode, encode, message
+try:
+    from .network_errors import is_transient_network_error
+except ImportError:
+    from network_errors import is_transient_network_error
 
 
 LeaderAddress = tuple[str, int]
@@ -37,7 +41,14 @@ def enviar_valor_stop_and_wait(
             f"{timestamp} server {leader[0]} {tipo_envio} "
             f"id_req {id_requisicao} value {valor_soma}"
         )
-        cliente.sendto(payload, leader)
+        try:
+            cliente.sendto(payload, leader)
+        except OSError as exc:
+            if not is_transient_network_error(exc):
+                raise
+            leader = rediscover()
+            timeouts = 0
+            continue
         tentativas += 1
         deadline = time.monotonic() + timeout
         while True:
