@@ -490,12 +490,15 @@ class ServerNode:
             return
         with self.state.lock:
             was_leaving = self.state.role == "LEAVING"
+            was_candidate = self.state.role == "CANDIDATE"
         self.state.install_snapshot(replicated)
         self.state.install_membership(snapshot["members"], time.monotonic())
         with self.state.lock:
             self.state.leader_id = snapshot.get("leader_id") or sender_id
             if was_leaving:
                 self.state.role = "LEAVING"
+            elif was_candidate:
+                self.state.role = "CANDIDATE"
             else:
                 self.state.role = (
                     "PRIMARY"
@@ -790,35 +793,29 @@ class ServerNode:
     def handle_client_leave(self, payload: dict[str, Any], address: tuple[str, int]) -> None:
         self.log(f"client_leave {payload.get('client_id', 'unknown')}")
 
+    def handle_primary_conflict(
+        self, incoming_term: int, incoming_leader_id: int, *, coordinator: bool = False
+    ) -> bool:
+        with self.state.lock:
+            if self.state.role != "PRIMARY":
+                return False
+            if incoming_term < self.state.replicated.election_term:
+                return True
+            if coordinator and incoming_leader_id > self.state.server_id:
+                return False
+        threading.Thread(target=self.start_election, daemon=True).start()
+        return True
+
     def handle_heartbeat(self, payload: dict[str, Any], address: tuple[str, int]) -> None:
         server_id = self.note_server(payload, address, "ACTIVE")
         if server_id == self.state.server_id:
             return
 
         incoming_term = int(payload.get("term", 0))
-        incoming_version = int(payload.get("state_version", 0))
+        if self.handle_primary_conflict(incoming_term, server_id):
+            return
 
         with self.state.lock:
-            if (
-                incoming_version < self.state.replicated.state_version
-                and incoming_term >= self.state.replicated.election_term
-            ):
-                if self.state.role != "CANDIDATE":
-                    threading.Thread(target=self.start_election, daemon=True).start()
-                return
-
-            if incoming_version < self.state.replicated.state_version:
-                return
-
-            if (
-                incoming_term == self.state.replicated.election_term
-                and incoming_version == self.state.replicated.state_version
-                and self.state.role == "PRIMARY"
-            ):
-                if self.state.role != "CANDIDATE":
-                    threading.Thread(target=self.start_election, daemon=True).start()
-                return
-
             if incoming_term < self.state.replicated.election_term:
                 return
 
@@ -900,7 +897,15 @@ class ServerNode:
                 and self.state.server_id > candidate_id
             )
         if eligible:
-            self.send(self.server_message("ELECTION_OK", candidate_id=candidate_id), address)
+            response = message(
+                "ELECTION_OK",
+                server_id=self.state.server_id,
+                host=self.state.bind_host,
+                port=self.state.port,
+                term=incoming_term,
+                candidate_id=candidate_id,
+            )
+            self.send(response, address)
             threading.Thread(target=self.start_election, daemon=True).start()
 
     def handle_election_ok(self, payload: dict[str, Any], address: tuple[str, int]) -> None:
@@ -911,6 +916,8 @@ class ServerNode:
 
     def become_coordinator(self, term: int) -> None:
         with self.state.lock:
+            if self.state.role != "CANDIDATE" or self.state.replicated.election_term != term:
+                return
             self.summary_responses[term] = {
                 self.state.server_id: (
                     self.state.replicated.state_version,
@@ -932,6 +939,8 @@ class ServerNode:
                 threading.Timer(0.1, self.start_election).start()
                 return
         with self.state.lock:
+            if self.state.role != "CANDIDATE" or self.state.replicated.election_term != term:
+                return
             self.state.leader_id = self.state.server_id
             self.state.replicated.election_term = max(
                 self.state.replicated.election_term, term
@@ -1010,6 +1019,9 @@ class ServerNode:
         if leader_id == self.state.server_id:
             return
         incoming_term = int(payload.get("term", 0))
+        if self.handle_primary_conflict(incoming_term, leader_id, coordinator=True):
+            return
+
         with self.state.lock:
             if incoming_term < self.state.replicated.election_term:
                 return

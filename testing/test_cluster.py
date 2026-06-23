@@ -223,6 +223,122 @@ class ClusterIntegrationTests(unittest.TestCase):
         self.assertFalse(worker.is_alive())
         self.assertEqual(result, [False])
 
+    def test_two_primary_heartbeat_conflict_elects_highest_server(self) -> None:
+        first = self.add_node(1)
+        second = self.add_node(2)
+        wait_until(lambda: second.state.role == "PRIMARY" and first.state.role == "BACKUP")
+
+        with second.state.lock:
+            term = second.state.replicated.election_term
+        with first.state.lock:
+            first.state.role = "PRIMARY"
+            first.state.leader_id = 1
+            first.state.replicated.election_term = term
+
+        first.handle_heartbeat(
+            second.server_message(
+                "HEARTBEAT",
+                state_version=second.state.replicated.state_version,
+                membership=second.state.membership_payload(),
+            ),
+            second.state.address,
+        )
+
+        wait_until(
+            lambda: second.state.role == "PRIMARY"
+            and first.state.role == "BACKUP"
+            and first.state.leader_id == 2,
+            timeout=10.0,
+        )
+
+    def test_lower_id_coordinator_conflict_elects_highest_server(self) -> None:
+        first = self.add_node(1)
+        second = self.add_node(2)
+        wait_until(lambda: second.state.role == "PRIMARY" and first.state.role == "BACKUP")
+
+        with second.state.lock:
+            term = second.state.replicated.election_term
+        with first.state.lock:
+            first.state.role = "PRIMARY"
+            first.state.leader_id = 1
+            first.state.replicated.election_term = term
+
+        second.handle_coordinator(
+            first.server_message(
+                "COORDINATOR",
+                leader_id=1,
+                state_version=first.state.replicated.state_version,
+                membership=first.state.membership_payload(),
+            ),
+            first.state.address,
+        )
+
+        wait_until(
+            lambda: second.state.role == "PRIMARY"
+            and first.state.role == "BACKUP"
+            and first.state.leader_id == 2,
+            timeout=10.0,
+        )
+
+    def test_stale_candidate_cannot_become_coordinator_after_newer_coordinator(self) -> None:
+        candidate = ServerNode(self.base_port + 100, 1, "127.0.0.1")
+        self.nodes.append(candidate)
+        with candidate.state.lock:
+            candidate.state.role = "CANDIDATE"
+            candidate.state.leader_id = None
+            candidate.state.replicated.election_term = 2
+
+        candidate.handle_coordinator(
+            message(
+                "COORDINATOR",
+                server_id=2,
+                host="127.0.0.1",
+                port=self.base_port + 101,
+                term=3,
+                leader_id=2,
+                state_version=0,
+                membership=[],
+            ),
+            ("127.0.0.1", self.base_port + 101),
+        )
+        candidate.become_coordinator(2)
+
+        with candidate.state.lock:
+            self.assertEqual(candidate.state.role, "BACKUP")
+            self.assertEqual(candidate.state.leader_id, 2)
+            self.assertEqual(candidate.state.replicated.election_term, 3)
+
+    def test_election_ok_uses_candidate_term(self) -> None:
+        responder = ServerNode(self.base_port + 110, 2, "127.0.0.1")
+        self.nodes.append(responder)
+        sent: list[dict] = []
+
+        def record_send(payload, _address):
+            sent.append(payload)
+
+        responder.send = record_send
+        responder.start_election = lambda: None
+        with responder.state.lock:
+            responder.state.role = "PRIMARY"
+            responder.state.leader_id = 2
+            responder.state.replicated.election_term = 5
+
+        responder.handle_election(
+            message(
+                "ELECTION",
+                server_id=1,
+                host="127.0.0.1",
+                port=self.base_port + 111,
+                term=3,
+                candidate_id=1,
+            ),
+            ("127.0.0.1", self.base_port + 111),
+        )
+
+        self.assertEqual(sent[0]["type"], "ELECTION_OK")
+        self.assertEqual(sent[0]["term"], 3)
+        self.assertEqual(sent[0]["candidate_id"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
