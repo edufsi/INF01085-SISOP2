@@ -801,13 +801,17 @@ class ServerNode:
         self, incoming_term: int, incoming_leader_id: int, *, coordinator: bool = False
     ) -> bool:
         with self.state.lock:
+            # Se eu sou BACKUP, JOINING, etc., não é problema meu brigar.
+            # Retorno False para que o handle_heartbeat processe o pacote normalmente.
             if self.state.role != "PRIMARY":
                 return False
-            if incoming_term < self.state.replicated.election_term:
-                return True
-            if coordinator and incoming_leader_id > self.state.server_id:
-                return False
+
+        # Se o código chegou aqui, EU sou PRIMARY.
+        # E se chamaram essa função, é porque chegou um pacote de liderança de OUTRA pessoa.
+        # Não importa o termo, não importa a versão. Dispara a eleição imediatamente.
         threading.Thread(target=self.start_election, daemon=True).start()
+        
+        # Retorna True para interceptar e matar o processamento desse Heartbeat fantasma.
         return True
 
     def handle_heartbeat(self, payload: dict[str, Any], address: tuple[str, int]) -> None:
