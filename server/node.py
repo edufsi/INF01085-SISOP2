@@ -292,6 +292,7 @@ class ServerNode:
                         state_version=self.state.replicated.state_version,
                     )
                 )
+
             self.check_startup(now)
             self.check_failures(now)
             time.sleep(0.1)
@@ -793,10 +794,34 @@ class ServerNode:
         server_id = self.note_server(payload, address, "ACTIVE")
         if server_id == self.state.server_id:
             return
+
         incoming_term = int(payload.get("term", 0))
+        incoming_version = int(payload.get("state_version", 0))
+
         with self.state.lock:
+            if (
+                incoming_version < self.state.replicated.state_version
+                and incoming_term >= self.state.replicated.election_term
+            ):
+                if self.state.role != "CANDIDATE":
+                    threading.Thread(target=self.start_election, daemon=True).start()
+                return
+
+            if incoming_version < self.state.replicated.state_version:
+                return
+
+            if (
+                incoming_term == self.state.replicated.election_term
+                and incoming_version == self.state.replicated.state_version
+                and self.state.role == "PRIMARY"
+            ):
+                if self.state.role != "CANDIDATE":
+                    threading.Thread(target=self.start_election, daemon=True).start()
+                return
+
             if incoming_term < self.state.replicated.election_term:
                 return
+
             self.state.replicated.election_term = incoming_term
             self.state.leader_id = server_id
             if (
@@ -805,6 +830,7 @@ class ServerNode:
             ):
                 self.state.role = "BACKUP" if self.state.role != "JOINING" else "JOINING"
             self.last_leader_heartbeat = time.monotonic()
+
         if "membership" in payload and self.state.role != "JOINING":
             self.state.install_membership(payload["membership"], time.monotonic())
 
