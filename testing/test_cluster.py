@@ -3,8 +3,8 @@ import threading
 import time
 import unittest
 
-from common.protocol import decode, encode, message
-from server.node import ServerNode
+from common.protocol import decode, encode, message, snapshot_chunks
+from server.node import NodeTiming, ServerNode
 from server.state import MemberState
 
 
@@ -65,6 +65,27 @@ class ClusterIntegrationTests(unittest.TestCase):
             raise AssertionError("request was not acknowledged")
         finally:
             client.close()
+
+    @staticmethod
+    def wire_direct(nodes: list[ServerNode], client_messages: list[dict] | None = None) -> None:
+        by_address = {node.state.address: node for node in nodes}
+
+        for node in nodes:
+            def direct_send(payload, address, *, sender=node):
+                target = by_address.get(address)
+                if target is None:
+                    if client_messages is not None:
+                        client_messages.append(payload)
+                    return
+                target.dispatch(payload, sender.state.address)
+
+            def direct_broadcast(payload, *, sender=node):
+                for target in nodes:
+                    if target is not sender:
+                        sender.send(payload, target.state.address)
+
+            node.send = direct_send
+            node.broadcast = direct_broadcast
 
     def test_replication_failover_and_higher_priority_join(self) -> None:
         first = self.add_node(1)
@@ -384,10 +405,256 @@ class ClusterIntegrationTests(unittest.TestCase):
         with node.state.lock:
             self.assertEqual(node.state.members[2].address, ("10.0.0.5", 45000))
 
+    def test_split_rejoin_elected_leader_catches_up_before_serving_client(self) -> None:
+        fresh = ServerNode(
+            self.base_port + 140,
+            1,
+            "127.0.0.1",
+            request_logging=False,
+            startup_logging=False,
+        )
+        stale = ServerNode(
+            self.base_port + 141,
+            2,
+            "127.0.0.1",
+            request_logging=False,
+            startup_logging=False,
+        )
+        self.nodes.extend([fresh, stale])
+        client_messages: list[dict] = []
+        self.wire_direct([fresh, stale], client_messages)
+        now = time.monotonic()
+        with fresh.state.lock:
+            fresh.state.role = "PRIMARY"
+            fresh.state.leader_id = 1
+            fresh.state.replicated.election_term = 5
+            fresh.state.members[1] = MemberState(1, "127.0.0.1", fresh.state.port, "ACTIVE", now)
+            fresh.state.members[2] = MemberState(2, "127.0.0.1", stale.state.port, "ACTIVE", now)
+            for request_id in range(1, 32):
+                fresh.state.replicated.apply_request(
+                    "client-a", request_id, 1, "127.0.0.1", self.base_port + 500
+                )
+        with stale.state.lock:
+            stale.state.role = "PRIMARY"
+            stale.state.leader_id = 2
+            stale.state.replicated.election_term = 5
+            stale.state.members[1] = MemberState(1, "127.0.0.1", fresh.state.port, "ACTIVE", now)
+            stale.state.members[2] = MemberState(2, "127.0.0.1", stale.state.port, "ACTIVE", now)
+            for request_id in range(1, 21):
+                stale.state.replicated.apply_request(
+                    "client-a", request_id, 1, "127.0.0.1", self.base_port + 500
+                )
+
+        stale.start_election()
+        wait_until(
+            lambda: stale.state.role == "PRIMARY"
+            and stale.state.replicated.state_version == 31
+            and fresh.state.role == "BACKUP"
+            and fresh.state.leader_id == 2,
+            timeout=5.0,
+        )
+
+        stale.handle_client_request(
+            message("CLIENT_REQUEST", client_id="client-a", request_id=32, value=1),
+            ("127.0.0.1", self.base_port + 500),
+        )
+
+        self.assertEqual(client_messages[-1]["type"], "CLIENT_ACK")
+        self.assertEqual(client_messages[-1]["request_id"], 32)
+        self.assertEqual(client_messages[-1]["num_reqs"], 32)
+        wait_until(lambda: fresh.state.replicated.state_version == 32)
+
+    def test_summary_response_matches_candidate_summary_term(self) -> None:
+        node = ServerNode(self.base_port + 142, 1, "127.0.0.1")
+        self.nodes.append(node)
+        with node.state.lock:
+            node.summary_responses[8] = {}
+
+        node.handle_summary(
+            message(
+                "STATE_SUMMARY",
+                server_id=2,
+                host="127.0.0.1",
+                port=self.base_port + 143,
+                term=3,
+                summary_term=8,
+                state_version=12,
+            ),
+            ("127.0.0.1", self.base_port + 143),
+        )
+
+        with node.state.lock:
+            self.assertEqual(
+                node.summary_responses[8][2],
+                (12, ("127.0.0.1", self.base_port + 143)),
+            )
+
+    def test_candidate_installs_fresher_snapshot_with_lower_term(self) -> None:
+        node = ServerNode(self.base_port + 144, 1, "127.0.0.1")
+        self.nodes.append(node)
+        sent: list[dict] = []
+        node.send = lambda payload, _address: sent.append(payload)
+        with node.state.lock:
+            node.state.role = "CANDIDATE"
+            node.state.leader_id = None
+            node.state.replicated.election_term = 7
+
+        snapshot = {
+            "replicated": {
+                "num_reqs": 1,
+                "total_sum": 9,
+                "state_version": 1,
+                "election_term": 3,
+                "membership_version": 1,
+                "clients": {
+                    "client-a": {
+                        "last_req": 1,
+                        "last_num_reqs": 1,
+                        "last_total_sum": 9,
+                        "last_value": 9,
+                        "last_host": "127.0.0.1",
+                        "last_port": self.base_port + 145,
+                    }
+                },
+            },
+            "members": [],
+            "leader_id": 2,
+        }
+        for chunk in snapshot_chunks(snapshot, "snapshot-lower-term"):
+            chunk.update(
+                server_id=2,
+                host="127.0.0.1",
+                port=self.base_port + 146,
+                term=3,
+            )
+            node.handle_snapshot_chunk(chunk, ("127.0.0.1", self.base_port + 146))
+
+        with node.state.lock:
+            self.assertEqual(node.state.role, "CANDIDATE")
+            self.assertEqual(node.state.replicated.state_version, 1)
+            self.assertEqual(node.state.replicated.election_term, 7)
+            self.assertEqual(node.state.replicated.clients["client-a"].last_req, 1)
+        self.assertEqual(sent[-1]["type"], "SNAPSHOT_ACK")
+
+    def test_stale_coordinator_is_rejected_without_demoting_fresher_primary(self) -> None:
+        logs: list[str] = []
+        snapshot_targets: list[tuple[int, tuple[str, int]]] = []
+        recovery: list[bool] = []
+        node = ServerNode(
+            self.base_port + 147,
+            1,
+            "127.0.0.1",
+            event_logger=logs.append,
+            request_logging=False,
+            startup_logging=False,
+        )
+        self.nodes.append(node)
+        node.send_snapshot = lambda server_id, address: snapshot_targets.append((server_id, address)) or True
+        node.start_election = lambda: recovery.append(True)
+        with node.state.lock:
+            node.state.role = "PRIMARY"
+            node.state.leader_id = 1
+            node.state.replicated.election_term = 4
+            node.state.members[2] = MemberState(
+                2, "127.0.0.1", self.base_port + 148, "ACTIVE", time.monotonic()
+            )
+            for request_id in range(1, 6):
+                node.state.replicated.apply_request(
+                    "client-a", request_id, 1, "127.0.0.1", self.base_port + 149
+                )
+
+        node.handle_coordinator(
+            message(
+                "COORDINATOR",
+                server_id=2,
+                host="127.0.0.1",
+                port=self.base_port + 148,
+                term=5,
+                leader_id=2,
+                state_version=2,
+                membership=[],
+            ),
+            ("127.0.0.1", self.base_port + 148),
+        )
+
+        with node.state.lock:
+            self.assertEqual(node.state.role, "PRIMARY")
+            self.assertEqual(node.state.leader_id, 1)
+        wait_until(lambda: bool(snapshot_targets))
+        wait_until(lambda: bool(recovery))
+        self.assertTrue(any("coordinator_rejected reason=stale_state" in line for line in logs))
+
+    def test_replication_timeout_returns_false_and_schedules_recovery(self) -> None:
+        recovery: list[bool] = []
+        primary = ServerNode(
+            self.base_port + 149,
+            1,
+            "127.0.0.1",
+            request_logging=False,
+            startup_logging=False,
+            timing=NodeTiming(retry_interval=0.01, replication_timeout=0.05),
+        )
+        self.nodes.append(primary)
+        primary.send = lambda _payload, _address: None
+        primary.start_election = lambda: recovery.append(True)
+        backup = MemberState(
+            server_id=2,
+            host="127.0.0.1",
+            port=self.base_port + 150,
+            status="ACTIVE",
+            last_seen=time.monotonic(),
+        )
+        with primary.state.lock:
+            primary.state.role = "PRIMARY"
+            primary.state.leader_id = 1
+            primary.state.members[2] = backup
+            operation = primary.server_message(
+                "REPLICATION",
+                state_version=1,
+                client_id="client-a",
+                request_id=1,
+                value=1,
+            )
+
+        started = time.monotonic()
+        self.assertFalse(primary.replicate_to_all(operation, [backup]))
+        self.assertLess(time.monotonic() - started, 1.0)
+        wait_until(lambda: bool(recovery))
+
+    def test_newer_replication_ack_schedules_recovery(self) -> None:
+        recovery: list[bool] = []
+        node = ServerNode(self.base_port + 151, 1, "127.0.0.1")
+        self.nodes.append(node)
+        node.start_election = lambda: recovery.append(True)
+        with node.state.lock:
+            node.state.role = "PRIMARY"
+            node.state.leader_id = 1
+            node.state.replicated.election_term = 2
+            node.state.replicated.apply_request(
+                "client-a", 1, 1, "127.0.0.1", self.base_port + 152
+            )
+            node.state.members[2] = MemberState(
+                2, "127.0.0.1", self.base_port + 153, "ACTIVE", time.monotonic()
+            )
+
+        node.handle_replication_ack(
+            message(
+                "REPLICATION_ACK",
+                server_id=2,
+                host="127.0.0.1",
+                port=self.base_port + 153,
+                term=2,
+                state_version=5,
+            ),
+            ("127.0.0.1", self.base_port + 153),
+        )
+
+        wait_until(lambda: bool(recovery))
+
     def test_status_log_includes_client_tracking_and_terms(self) -> None:
         logs: list[str] = []
         node = ServerNode(
-            self.base_port + 140,
+            self.base_port + 160,
             1,
             "127.0.0.1",
             event_logger=logs.append,
@@ -401,13 +668,13 @@ class ClusterIntegrationTests(unittest.TestCase):
             node.state.replicated.election_term = 3
             node.state.replicated.membership_version = 2
             node.state.members[1] = MemberState(
-                1, "127.0.0.1", self.base_port + 140, "ACTIVE", time.monotonic()
+                1, "127.0.0.1", self.base_port + 160, "ACTIVE", time.monotonic()
             )
             node.state.members[2] = MemberState(
-                2, "127.0.0.1", self.base_port + 141, "ACTIVE", time.monotonic()
+                2, "127.0.0.1", self.base_port + 161, "ACTIVE", time.monotonic()
             )
             node.state.replicated.apply_request(
-                "client-a", 1, 7, "127.0.0.1", self.base_port + 142
+                "client-a", 1, 7, "127.0.0.1", self.base_port + 162
             )
 
         node.log_status()
@@ -423,7 +690,7 @@ class ClusterIntegrationTests(unittest.TestCase):
         self.assertIn("active_ids=[1, 2]", logs[-1])
         self.assertIn(
             f"client-a:last_req=1:last_num_reqs=1:last_total_sum=7:"
-            f"addr=127.0.0.1:{self.base_port + 142}",
+            f"addr=127.0.0.1:{self.base_port + 162}",
             logs[-1],
         )
 
@@ -471,6 +738,7 @@ class ClusterIntegrationTests(unittest.TestCase):
         )
         self.nodes.append(node)
         node.send = lambda payload, _address: sent.append(payload)
+        node.start_election = lambda: None
         with node.state.lock:
             node.state.role = "PRIMARY"
             node.state.leader_id = 1
@@ -491,8 +759,8 @@ class ClusterIntegrationTests(unittest.TestCase):
                 for line in logs
             )
         )
-        self.assertEqual(sent[-1]["type"], "CLIENT_ACK")
-        self.assertEqual(sent[-1]["request_id"], 1)
+        self.assertEqual(sent[-1]["type"], "RETRY")
+        self.assertEqual(sent[-1]["reason"], "state_gap")
 
     def test_replication_interruption_logs_rejection_reason(self) -> None:
         logs: list[str] = []

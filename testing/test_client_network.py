@@ -198,6 +198,71 @@ class ClientNetworkRecoveryTests(unittest.TestCase):
         self.assertEqual(payload["request_id"], 12)
         self.assertEqual(payload["value"], 55)
 
+    def test_request_rediscover_after_repeated_retry_responses(self) -> None:
+        class RetryThenAckSocket:
+            def __init__(self) -> None:
+                self.sent: list[tuple[dict, tuple[str, int]]] = []
+                self.responses = 0
+
+            def sendto(self, data: bytes, address: tuple[str, int]) -> int:
+                self.sent.append((decode(data), address))
+                return len(data)
+
+            def settimeout(self, _timeout: float) -> None:
+                pass
+
+            def recvfrom(self, _size: int) -> tuple[bytes, tuple[str, int]]:
+                self.responses += 1
+                if self.responses <= 3:
+                    return (
+                        encode(message("RETRY", reason="state_gap")),
+                        ("10.0.0.1", 45000),
+                    )
+                return (
+                    encode(
+                        message(
+                            "CLIENT_ACK",
+                            client_id="client-a",
+                            request_id=12,
+                            num_reqs=34,
+                            total_sum=987,
+                        )
+                    ),
+                    ("10.0.0.9", 45000),
+                )
+
+        output_queue: Queue = Queue()
+        socket = RetryThenAckSocket()
+        rediscover_calls = 0
+
+        def rediscover() -> tuple[str, int]:
+            nonlocal rediscover_calls
+            rediscover_calls += 1
+            return ("10.0.0.9", 45000)
+
+        with patch("client.processing.time.sleep", return_value=None):
+            num_reqs, total_sum, leader = enviar_valor_stop_and_wait(
+                socket,
+                ("10.0.0.1", 45000),
+                "client-a",
+                12,
+                55,
+                output_queue,
+                rediscover,
+            )
+
+        self.assertEqual((num_reqs, total_sum, leader), (34, 987, ("10.0.0.9", 45000)))
+        self.assertEqual(rediscover_calls, 1)
+        self.assertEqual([address for _payload, address in socket.sent], [
+            ("10.0.0.1", 45000),
+            ("10.0.0.1", 45000),
+            ("10.0.0.1", 45000),
+            ("10.0.0.9", 45000),
+        ])
+        for payload, _address in socket.sent:
+            self.assertEqual(payload["request_id"], 12)
+            self.assertEqual(payload["value"], 55)
+
     def test_request_send_reraises_non_transient_os_errors(self) -> None:
         output_queue: Queue = Queue()
         rediscover_calls = 0

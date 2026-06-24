@@ -34,6 +34,7 @@ def enviar_valor_stop_and_wait(
     )
     tentativas = 0
     timeouts = 0
+    retries = 0
     while True:
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         tipo_envio = "SEND" if tentativas == 0 else "RESEND"
@@ -80,8 +81,13 @@ def enviar_valor_stop_and_wait(
                 host = resposta.get("leader_host")
                 port = resposta.get("leader_port")
                 leader = (str(host), int(port)) if host and port else rediscover()
+                retries = 0
                 break
             if tipo == "RETRY":
+                retries += 1
+                if retries >= 3:
+                    leader = rediscover()
+                    retries = 0
                 time.sleep(0.05)
                 break
             if tipo == "ERROR":
@@ -93,4 +99,5 @@ def enviar_valor_stop_and_wait(
             ack_id = int(resposta["request_id"])
             if ack_id != id_requisicao:
                 continue
+            retries = 0
             return int(resposta["num_reqs"]), int(resposta["total_sum"]), endereco

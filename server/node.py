@@ -34,6 +34,7 @@ STARTUP_SETTLE = 1.2
 ELECTION_RESPONSE_TIMEOUT = 0.7
 COORDINATOR_TIMEOUT = 2.5
 RETRY_INTERVAL = 0.2
+REPLICATION_TIMEOUT = 2.5
 STATUS_LOG_INTERVAL = 2.0
 
 
@@ -47,6 +48,7 @@ class NodeTiming:
     election_response_timeout: float = ELECTION_RESPONSE_TIMEOUT
     coordinator_timeout: float = COORDINATOR_TIMEOUT
     retry_interval: float = RETRY_INTERVAL
+    replication_timeout: float = REPLICATION_TIMEOUT
 
 
 @dataclass
@@ -135,6 +137,10 @@ class ServerNode:
             self.event_logger(line)
         else:
             print(line, flush=True)
+
+    def schedule_recovery(self, reason: str) -> None:
+        self.log(f"recovery_scheduled reason={reason}")
+        threading.Timer(0.1, self.start_election).start()
 
     @staticmethod
     def _address_text(address: tuple[str, int]) -> str:
@@ -571,8 +577,7 @@ class ServerNode:
         replicated = snapshot["replicated"]
         incoming_term = int(replicated["election_term"])
         with self.state.lock:
-            if incoming_term < self.state.replicated.election_term:
-                return
+            local_term = self.state.replicated.election_term
             local_version = self.state.replicated.state_version
         if int(replicated["state_version"]) < local_version:
             self.snapshot_receivers.pop(transfer_id, None)
@@ -587,6 +592,12 @@ class ServerNode:
         self.state.install_snapshot(replicated)
         self.state.install_membership(snapshot["members"], time.monotonic())
         with self.state.lock:
+            self.state.replicated.election_term = max(
+                self.state.replicated.election_term,
+                incoming_term,
+                local_term,
+                int(payload.get("term", 0)),
+            )
             self.state.leader_id = snapshot.get("leader_id") or sender_id
             if was_leaving:
                 self.state.role = "LEAVING"
@@ -769,6 +780,10 @@ class ServerNode:
                         stored_num_reqs=client.last_num_reqs,
                         stored_total_sum=client.last_total_sum,
                     )
+                    if classification == "FUTURE":
+                        self.send(self.server_message("RETRY", reason="state_gap"), address)
+                        self.schedule_recovery("client_state_gap")
+                        return
                     self.reply_client(
                         address,
                         client_id,
@@ -823,6 +838,7 @@ class ServerNode:
     ) -> bool:
         version = int(operation["state_version"])
         operation_term = int(operation["term"])
+        deadline = time.monotonic() + self.timing.replication_timeout
         pending: dict[int, tuple[threading.Event, tuple[str, int]]] = {}
         for backup in backups:
             event = threading.Event()
@@ -838,6 +854,13 @@ class ServerNode:
                     ):
                         return False
                     active_ids = {member.server_id for member in self.state.active_members()}
+                if time.monotonic() >= deadline:
+                    self.log(
+                        f"replication_timeout version={version} "
+                        f"pending={sorted(pending)}"
+                    )
+                    self.schedule_recovery("replication_timeout")
+                    return False
                 for server_id, (event, target) in list(pending.items()):
                     if event.wait(self.timing.retry_interval):
                         pending.pop(server_id, None)
@@ -919,6 +942,15 @@ class ServerNode:
                 or member is None
                 or member.status != "ACTIVE"
             ):
+                return
+            local_version = self.state.replicated.state_version
+            if version > local_version:
+                self.log(
+                    f"replication_ack_newer_than_primary server_id={server_id} "
+                    f"ack_version={version} local_state_version={local_version} "
+                    f"term={incoming_term}"
+                )
+                self.schedule_recovery("replication_ack_newer_than_primary")
                 return
             member.host = str(payload.get("host") or address[0])
             member.port = int(payload.get("port") or address[1])
@@ -1082,31 +1114,89 @@ class ServerNode:
             event.set()
 
     def become_coordinator(self, term: int) -> None:
+        deadline = time.monotonic() + self.timing.coordinator_timeout
         with self.state.lock:
             if self.state.role != "CANDIDATE" or self.state.replicated.election_term != term:
                 return
+            now = time.monotonic()
+            active_peers = self.state.active_members()
+            stale_ids = [
+                member.server_id
+                for member in active_peers
+                if now - member.last_seen > self.timing.failure_timeout
+            ]
+            for server_id in stale_ids:
+                self.state.members.pop(server_id, None)
+            if stale_ids:
+                self.state.replicated.membership_version += 1
+            stale_set = set(stale_ids)
+            peers = [
+                member
+                for member in active_peers
+                if member.server_id not in stale_set
+            ]
             self.summary_responses[term] = {
                 self.state.server_id: (
                     self.state.replicated.state_version,
                     self.state.address,
                 )
             }
-            peers = self.state.active_members()
-        for peer in peers:
-            self.send(self.server_message("STATE_SUMMARY_REQUEST"), peer.address)
-        time.sleep(self.timing.election_response_timeout)
-        summaries = self.summary_responses.pop(term, {})
+        while True:
+            with self.state.lock:
+                if self.state.role != "CANDIDATE" or self.state.replicated.election_term != term:
+                    self.summary_responses.pop(term, None)
+                    return
+                responses = self.summary_responses.get(term, {})
+                missing = [
+                    peer
+                    for peer in peers
+                    if peer.server_id not in responses
+                ]
+            if not missing:
+                break
+            now = time.monotonic()
+            if now >= deadline:
+                with self.state.lock:
+                    self.summary_responses.pop(term, None)
+                self.log(
+                    f"coordinator_recovery_failed reason=summary_timeout "
+                    f"term={term} missing={[peer.server_id for peer in missing]}"
+                )
+                self.schedule_recovery("summary_timeout")
+                return
+            for peer in missing:
+                self.send(
+                    self.server_message("STATE_SUMMARY_REQUEST", summary_term=term),
+                    peer.address,
+                )
+            time.sleep(min(self.timing.retry_interval, max(0.0, deadline - now)))
+        with self.state.lock:
+            summaries = self.summary_responses.pop(term, {})
         source_id, (_, source_address) = max(
             summaries.items(), key=lambda item: (item[1][0], item[0])
         )
+        source_version = summaries[source_id][0]
         if source_id != self.state.server_id:
             self.snapshot_installed.clear()
             self.send(self.server_message("SNAPSHOT_REQUEST"), source_address)
             if not self.snapshot_installed.wait(self.timing.coordinator_timeout):
-                threading.Timer(0.1, self.start_election).start()
+                self.log(
+                    f"coordinator_recovery_failed reason=snapshot_timeout "
+                    f"term={term} source_id={source_id} source_version={source_version}"
+                )
+                self.schedule_recovery("snapshot_timeout")
                 return
         with self.state.lock:
             if self.state.role != "CANDIDATE" or self.state.replicated.election_term != term:
+                return
+            if self.state.replicated.state_version < source_version:
+                self.log(
+                    f"coordinator_recovery_failed reason=snapshot_not_installed "
+                    f"term={term} source_id={source_id} "
+                    f"source_version={source_version} "
+                    f"local_state_version={self.state.replicated.state_version}"
+                )
+                self.schedule_recovery("snapshot_not_installed")
                 return
             self.state.leader_id = self.state.server_id
             self.state.replicated.election_term = max(
@@ -1145,19 +1235,23 @@ class ServerNode:
 
     def handle_summary_request(self, payload: dict[str, Any], address: tuple[str, int]) -> None:
         self.note_server(payload, address, "ACTIVE")
+        summary_term = int(payload.get("summary_term", payload.get("term", 0)))
         self.send(
             self.server_message(
-                "STATE_SUMMARY", state_version=self.state.replicated.state_version
+                "STATE_SUMMARY",
+                state_version=self.state.replicated.state_version,
+                summary_term=summary_term,
             ),
             address,
         )
 
     def handle_summary(self, payload: dict[str, Any], address: tuple[str, int]) -> None:
         server_id = self.note_server(payload, address, "ACTIVE")
-        term = int(payload.get("term", 0))
-        responses = self.summary_responses.get(term)
-        if responses is not None:
-            responses[server_id] = (int(payload["state_version"]), address)
+        summary_term = int(payload.get("summary_term", payload.get("term", 0)))
+        with self.state.lock:
+            responses = self.summary_responses.get(summary_term)
+            if responses is not None:
+                responses[server_id] = (int(payload["state_version"]), address)
 
     def announce_coordinator(self) -> None:
         announcement = self.server_message(
@@ -1186,6 +1280,29 @@ class ServerNode:
         if leader_id == self.state.server_id:
             return
         incoming_term = int(payload.get("term", 0))
+        incoming_version = int(payload.get("state_version", 0))
+        stale_snapshot_target: tuple[str, int] | None = None
+        with self.state.lock:
+            local_version = self.state.replicated.state_version
+            if incoming_version < local_version:
+                leader = self.state.members.get(leader_id)
+                stale_snapshot_target = leader.address if leader is not None else address
+                self.log(
+                    f"coordinator_rejected reason=stale_state "
+                    f"leader_id={leader_id} incoming_term={incoming_term} "
+                    f"incoming_state_version={incoming_version} "
+                    f"local_term={self.state.replicated.election_term} "
+                    f"local_role={self.state.role} "
+                    f"local_state_version={local_version}"
+                )
+        if stale_snapshot_target is not None:
+            threading.Thread(
+                target=self.send_snapshot,
+                args=(leader_id, stale_snapshot_target),
+                daemon=True,
+            ).start()
+            self.schedule_recovery("stale_coordinator_state")
+            return
         if self.handle_primary_conflict(incoming_term, leader_id, coordinator=True):
             return
 
