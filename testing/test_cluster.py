@@ -384,6 +384,235 @@ class ClusterIntegrationTests(unittest.TestCase):
         with node.state.lock:
             self.assertEqual(node.state.members[2].address, ("10.0.0.5", 45000))
 
+    def test_status_log_includes_client_tracking_and_terms(self) -> None:
+        logs: list[str] = []
+        node = ServerNode(
+            self.base_port + 140,
+            1,
+            "127.0.0.1",
+            event_logger=logs.append,
+            request_logging=False,
+            startup_logging=False,
+        )
+        self.nodes.append(node)
+        with node.state.lock:
+            node.state.role = "PRIMARY"
+            node.state.leader_id = 1
+            node.state.replicated.election_term = 3
+            node.state.replicated.membership_version = 2
+            node.state.members[1] = MemberState(
+                1, "127.0.0.1", self.base_port + 140, "ACTIVE", time.monotonic()
+            )
+            node.state.members[2] = MemberState(
+                2, "127.0.0.1", self.base_port + 141, "ACTIVE", time.monotonic()
+            )
+            node.state.replicated.apply_request(
+                "client-a", 1, 7, "127.0.0.1", self.base_port + 142
+            )
+
+        node.log_status()
+
+        self.assertIn("server_status server_id=1", logs[-1])
+        self.assertIn("role=PRIMARY", logs[-1])
+        self.assertIn("leader_id=1", logs[-1])
+        self.assertIn("term=3", logs[-1])
+        self.assertIn("state_version=1", logs[-1])
+        self.assertIn("membership_version=2", logs[-1])
+        self.assertIn("num_reqs=1", logs[-1])
+        self.assertIn("total_sum=7", logs[-1])
+        self.assertIn("active_ids=[1, 2]", logs[-1])
+        self.assertIn(
+            f"client-a:last_req=1:last_num_reqs=1:last_total_sum=7:"
+            f"addr=127.0.0.1:{self.base_port + 142}",
+            logs[-1],
+        )
+
+    def test_non_primary_client_request_logs_rejection(self) -> None:
+        logs: list[str] = []
+        sent: list[dict] = []
+        node = ServerNode(
+            self.base_port + 150,
+            1,
+            "127.0.0.1",
+            event_logger=logs.append,
+            request_logging=False,
+            startup_logging=False,
+        )
+        self.nodes.append(node)
+        node.send = lambda payload, _address: sent.append(payload)
+        with node.state.lock:
+            node.state.role = "BACKUP"
+            node.state.leader_id = 2
+            node.state.members[2] = MemberState(
+                2, "127.0.0.1", self.base_port + 151, "ACTIVE", time.monotonic()
+            )
+
+        node.handle_client_request(
+            message("CLIENT_REQUEST", client_id="client-a", request_id=1, value=5),
+            ("127.0.0.1", self.base_port + 152),
+        )
+
+        self.assertTrue(any("client_request_received" in line for line in logs))
+        self.assertTrue(
+            any("client_request_rejected reason=not_primary" in line for line in logs)
+        )
+        self.assertEqual(sent[-1]["type"], "NOT_LEADER")
+
+    def test_future_client_request_logs_stored_client_state(self) -> None:
+        logs: list[str] = []
+        sent: list[dict] = []
+        node = ServerNode(
+            self.base_port + 160,
+            1,
+            "127.0.0.1",
+            event_logger=logs.append,
+            request_logging=False,
+            startup_logging=False,
+        )
+        self.nodes.append(node)
+        node.send = lambda payload, _address: sent.append(payload)
+        with node.state.lock:
+            node.state.role = "PRIMARY"
+            node.state.leader_id = 1
+            node.state.replicated.apply_request(
+                "client-a", 1, 7, "127.0.0.1", self.base_port + 161
+            )
+
+        node.handle_client_request(
+            message("CLIENT_REQUEST", client_id="client-a", request_id=3, value=9),
+            ("127.0.0.1", self.base_port + 162),
+        )
+
+        self.assertTrue(
+            any(
+                "client_request_rejected reason=future" in line
+                and "stored_last_req=1" in line
+                and "request_id=3" in line
+                for line in logs
+            )
+        )
+        self.assertEqual(sent[-1]["type"], "CLIENT_ACK")
+        self.assertEqual(sent[-1]["request_id"], 1)
+
+    def test_replication_interruption_logs_rejection_reason(self) -> None:
+        logs: list[str] = []
+        sent: list[dict] = []
+        node = ServerNode(
+            self.base_port + 170,
+            1,
+            "127.0.0.1",
+            event_logger=logs.append,
+            request_logging=False,
+            startup_logging=False,
+        )
+        self.nodes.append(node)
+        node.send = lambda payload, _address: sent.append(payload)
+        node.replicate_to_all = lambda _operation, _backups: False
+        with node.state.lock:
+            node.state.role = "PRIMARY"
+            node.state.leader_id = 1
+
+        node.handle_client_request(
+            message("CLIENT_REQUEST", client_id="client-a", request_id=1, value=9),
+            ("127.0.0.1", self.base_port + 171),
+        )
+
+        self.assertTrue(
+            any(
+                "client_request_rejected reason=replication_interrupted" in line
+                and "operation_state_version=1" in line
+                for line in logs
+            )
+        )
+        self.assertEqual(sent[-1]["type"], "RETRY")
+        self.assertEqual(sent[-1]["reason"], "replication_interrupted")
+
+    def test_backup_logs_discarded_replication(self) -> None:
+        logs: list[str] = []
+        sent: list[dict] = []
+        node = ServerNode(
+            self.base_port + 175,
+            1,
+            "127.0.0.1",
+            event_logger=logs.append,
+            request_logging=False,
+            startup_logging=False,
+        )
+        self.nodes.append(node)
+        node.send = lambda payload, _address: sent.append(payload)
+        with node.state.lock:
+            node.state.role = "BACKUP"
+            node.state.leader_id = 3
+            node.state.replicated.election_term = 2
+
+        node.handle_replication(
+            message(
+                "REPLICATION",
+                server_id=2,
+                host="127.0.0.1",
+                port=self.base_port + 176,
+                term=2,
+                state_version=1,
+                client_id="client-a",
+                request_id=1,
+                value=9,
+                client_host="127.0.0.1",
+                client_port=self.base_port + 177,
+            ),
+            ("127.0.0.1", self.base_port + 176),
+        )
+
+        self.assertFalse(sent)
+        self.assertTrue(
+            any(
+                "replication_rejected reason=sender_not_leader" in line
+                and "sender_id=2" in line
+                and "local_leader_id=3" in line
+                and "incoming_state_version=1" in line
+                for line in logs
+            )
+        )
+
+    def test_backup_logs_accepted_coordinator(self) -> None:
+        logs: list[str] = []
+        node = ServerNode(
+            self.base_port + 180,
+            1,
+            "127.0.0.1",
+            event_logger=logs.append,
+            request_logging=False,
+            startup_logging=False,
+        )
+        self.nodes.append(node)
+        with node.state.lock:
+            node.state.role = "BACKUP"
+            node.state.leader_id = None
+            node.state.replicated.election_term = 1
+
+        node.handle_coordinator(
+            message(
+                "COORDINATOR",
+                server_id=2,
+                host="127.0.0.1",
+                port=self.base_port + 181,
+                term=2,
+                leader_id=2,
+                state_version=4,
+                membership=[],
+            ),
+            ("127.0.0.1", self.base_port + 181),
+        )
+
+        self.assertTrue(
+            any(
+                "coordinator_accepted leader_id=2" in line
+                and "term=2" in line
+                and "role=BACKUP" in line
+                and "leader_state_version=4" in line
+                for line in logs
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -34,6 +34,7 @@ STARTUP_SETTLE = 1.2
 ELECTION_RESPONSE_TIMEOUT = 0.7
 COORDINATOR_TIMEOUT = 2.5
 RETRY_INTERVAL = 0.2
+STATUS_LOG_INTERVAL = 2.0
 
 
 @dataclass(frozen=True)
@@ -111,6 +112,7 @@ class ServerNode:
         self.last_join_hello = 0.0
         self.last_primary_heartbeat = 0.0
         self.last_backup_heartbeat = 0.0
+        self.last_status_log = self.started_at
 
     @staticmethod
     def _local_ip() -> str:
@@ -133,6 +135,90 @@ class ServerNode:
             self.event_logger(line)
         else:
             print(line, flush=True)
+
+    @staticmethod
+    def _address_text(address: tuple[str, int]) -> str:
+        return f"{address[0]}:{address[1]}"
+
+    def _client_tracking_text(self) -> str:
+        clients = sorted(self.state.replicated.clients.items())
+        if not clients:
+            return "[]"
+        entries = [
+            (
+                f"{client_id}:last_req={client.last_req}:"
+                f"last_num_reqs={client.last_num_reqs}:"
+                f"last_total_sum={client.last_total_sum}:"
+                f"addr={client.last_host}:{client.last_port}"
+            )
+            for client_id, client in clients
+        ]
+        return "[" + ",".join(entries) + "]"
+
+    def status_log_text(self) -> str:
+        with self.state.lock:
+            active_ids = sorted(
+                server_id
+                for server_id, member in self.state.members.items()
+                if member.status == "ACTIVE"
+            )
+            return (
+                f"server_status server_id={self.state.server_id} "
+                f"role={self.state.role} leader_id={self.state.leader_id} "
+                f"term={self.state.replicated.election_term} "
+                f"state_version={self.state.replicated.state_version} "
+                f"membership_version={self.state.replicated.membership_version} "
+                f"num_reqs={self.state.replicated.num_reqs} "
+                f"total_sum={self.state.replicated.total_sum} "
+                f"transitioning={self.state.transitioning.is_set()} "
+                f"active_ids={active_ids} clients={self._client_tracking_text()}"
+            )
+
+    def log_status(self) -> None:
+        self.log(self.status_log_text())
+
+    def log_client_request_received(
+        self,
+        address: tuple[str, int],
+        client_id: str,
+        request_id: int,
+        value: int,
+    ) -> None:
+        with self.state.lock:
+            text = (
+                f"client_request_received server_id={self.state.server_id} "
+                f"source={self._address_text(address)} client_id={client_id} "
+                f"request_id={request_id} value={value} role={self.state.role} "
+                f"leader_id={self.state.leader_id} "
+                f"term={self.state.replicated.election_term} "
+                f"state_version={self.state.replicated.state_version}"
+            )
+        self.log(text)
+
+    def log_client_request_rejected(
+        self,
+        reason: str,
+        address: tuple[str, int],
+        client_id: str,
+        request_id: int,
+        value: int,
+        **fields: Any,
+    ) -> None:
+        with self.state.lock:
+            parts = [
+                f"client_request_rejected reason={reason}",
+                f"server_id={self.state.server_id}",
+                f"source={self._address_text(address)}",
+                f"client_id={client_id}",
+                f"request_id={request_id}",
+                f"value={value}",
+                f"role={self.state.role}",
+                f"leader_id={self.state.leader_id}",
+                f"term={self.state.replicated.election_term}",
+                f"state_version={self.state.replicated.state_version}",
+            ]
+        parts.extend(f"{key}={value}" for key, value in fields.items())
+        self.log(" ".join(parts))
 
     def send(self, payload: dict[str, Any], address: tuple[str, int]) -> None:
         try:
@@ -295,6 +381,9 @@ class ServerNode:
 
             self.check_startup(now)
             self.check_failures(now)
+            if now - self.last_status_log >= STATUS_LOG_INTERVAL:
+                self.last_status_log = now
+                self.log_status()
             time.sleep(0.1)
 
     def check_startup(self, now: float) -> None:
@@ -633,24 +722,53 @@ class ServerNode:
             request_id = require_uint64(payload.get("request_id"), "request_id", positive=True)
             value = require_uint64(payload.get("value"), "value", positive=True)
         except ProtocolError as exc:
+            self.log(
+                f"client_request_invalid source={self._address_text(address)} "
+                f"reason={exc}"
+            )
             self.send(message("ERROR", reason=str(exc)), address)
             return
+        self.log_client_request_received(address, client_id, request_id, value)
         with self.state.lock:
             if self.state.role != "PRIMARY":
+                self.log_client_request_rejected(
+                    "not_primary", address, client_id, request_id, value
+                )
                 self.send_not_leader(address)
                 return
         if not self.state.transitioning.wait(0.5):
+            self.log_client_request_rejected(
+                "cluster_transition", address, client_id, request_id, value
+            )
             self.send(self.server_message("RETRY", reason="cluster_transition"), address)
             return
         with self.state.commit_lock:
             with self.state.lock:
                 if self.state.role != "PRIMARY":
+                    self.log_client_request_rejected(
+                        "not_primary_after_commit_lock",
+                        address,
+                        client_id,
+                        request_id,
+                        value,
+                    )
                     self.send_not_leader(address)
                     return
                 classification, client = self.state.replicated.classify_request(
                     client_id, request_id
                 )
                 if classification != "NEW":
+                    self.log_client_request_rejected(
+                        classification.lower(),
+                        address,
+                        client_id,
+                        request_id,
+                        value,
+                        classification=classification,
+                        stored_last_req=client.last_req,
+                        stored_num_reqs=client.last_num_reqs,
+                        stored_total_sum=client.last_total_sum,
+                    )
                     self.reply_client(
                         address,
                         client_id,
@@ -674,6 +792,14 @@ class ServerNode:
                 )
                 backups = self.state.active_members()
             if not self.replicate_to_all(operation, backups):
+                self.log_client_request_rejected(
+                    "replication_interrupted",
+                    address,
+                    client_id,
+                    request_id,
+                    value,
+                    operation_state_version=operation["state_version"],
+                )
                 self.send(self.server_message("RETRY", reason="replication_interrupted"), address)
                 return
             self.reply_client(
@@ -729,19 +855,56 @@ class ServerNode:
     def handle_replication(self, payload: dict[str, Any], address: tuple[str, int]) -> None:
         sender_id = self.note_server(payload, address, "ACTIVE")
         incoming_term = int(payload.get("term", 0))
+        incoming_version = int(payload.get("state_version", 0))
         with self.state.lock:
-            if (
-                sender_id != self.state.leader_id
-                or incoming_term < self.state.replicated.election_term
-                or self.state.role not in {"BACKUP", "JOINING"}
-            ):
+            reject_reason = None
+            if sender_id != self.state.leader_id:
+                reject_reason = "sender_not_leader"
+            elif incoming_term < self.state.replicated.election_term:
+                reject_reason = "stale_term"
+            elif self.state.role not in {"BACKUP", "JOINING"}:
+                reject_reason = "invalid_role"
+            if reject_reason is not None:
+                self.log(
+                    f"replication_rejected reason={reject_reason} "
+                    f"server_id={self.state.server_id} "
+                    f"source={self._address_text(address)} sender_id={sender_id} "
+                    f"incoming_term={incoming_term} "
+                    f"incoming_state_version={incoming_version} "
+                    f"local_role={self.state.role} "
+                    f"local_leader_id={self.state.leader_id} "
+                    f"local_term={self.state.replicated.election_term} "
+                    f"local_state_version={self.state.replicated.state_version}"
+                )
                 return
             try:
                 self.state.replicated.apply_replication(payload)
-            except ProtocolError:
+            except ProtocolError as exc:
+                self.log(
+                    f"replication_rejected reason=protocol_error "
+                    f"server_id={self.state.server_id} "
+                    f"source={self._address_text(address)} sender_id={sender_id} "
+                    f"incoming_term={incoming_term} "
+                    f"incoming_state_version={incoming_version} "
+                    f"local_role={self.state.role} "
+                    f"local_leader_id={self.state.leader_id} "
+                    f"local_term={self.state.replicated.election_term} "
+                    f"local_state_version={self.state.replicated.state_version} "
+                    f"error={exc}"
+                )
                 self.send(self.server_message("SNAPSHOT_REQUEST"), address)
                 return
             version = self.state.replicated.state_version
+            self.log(
+                f"replication_accepted server_id={self.state.server_id} "
+                f"source={self._address_text(address)} sender_id={sender_id} "
+                f"incoming_term={incoming_term} "
+                f"incoming_state_version={incoming_version} "
+                f"local_role={self.state.role} "
+                f"local_leader_id={self.state.leader_id} "
+                f"local_term={self.state.replicated.election_term} "
+                f"local_state_version={version}"
+            )
         self.send(self.server_message("REPLICATION_ACK", state_version=version), address)
 
     def handle_replication_ack(self, payload: dict[str, Any], address: tuple[str, int]) -> None:
@@ -1028,6 +1191,15 @@ class ServerNode:
 
         with self.state.lock:
             if incoming_term < self.state.replicated.election_term:
+                local_term = self.state.replicated.election_term
+                local_role = self.state.role
+                local_version = self.state.replicated.state_version
+                self.log(
+                    f"coordinator_rejected reason=stale_coordinator "
+                    f"leader_id={leader_id} incoming_term={incoming_term} "
+                    f"local_term={local_term} local_role={local_role} "
+                    f"local_state_version={local_version}"
+                )
                 return
             self.state.replicated.election_term = incoming_term
             self.state.leader_id = leader_id
@@ -1041,6 +1213,14 @@ class ServerNode:
         if "membership" in payload and self.state.role != "JOINING":
             self.state.install_membership(payload["membership"], time.monotonic())
         self.coordinator_announced.set()
+        with self.state.lock:
+            self.log(
+                f"coordinator_accepted leader_id={leader_id} "
+                f"term={self.state.replicated.election_term} "
+                f"role={self.state.role} "
+                f"local_state_version={self.state.replicated.state_version} "
+                f"leader_state_version={payload.get('state_version')}"
+            )
 
     def handle_server_leave(self, payload: dict[str, Any], address: tuple[str, int]) -> None:
         server_id = self.note_server(payload, address, "ACTIVE")
