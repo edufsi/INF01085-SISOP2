@@ -1,52 +1,103 @@
 from datetime import datetime
 from queue import Queue
 import socket
+import time
+from typing import Any, Callable
+
+from common.protocol import ProtocolError, decode, encode, message
+try:
+    from .network_errors import is_transient_network_error
+except ImportError:
+    from network_errors import is_transient_network_error
+
+
+LeaderAddress = tuple[str, int]
 
 
 def enviar_valor_stop_and_wait(
     cliente: socket.socket,
-    ip_servidor: str,
-    porta_destino: int,
+    leader: LeaderAddress,
+    client_id: str,
     id_requisicao: int,
     valor_soma: int,
     output_queue: Queue,
-) -> tuple[int, int]:
-
-    mensagem_envio = f"{id_requisicao},{valor_soma}"
+    rediscover: Callable[[], LeaderAddress],
+    timeout: float = 0.25,
+) -> tuple[int, int, LeaderAddress]:
+    payload = encode(
+        message(
+            "CLIENT_REQUEST",
+            client_id=client_id,
+            request_id=id_requisicao,
+            value=valor_soma,
+        )
+    )
     tentativas = 0
-
+    timeouts = 0
+    retries = 0
     while True:
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         tipo_envio = "SEND" if tentativas == 0 else "RESEND"
-        output_queue.put(f"{timestamp} server {ip_servidor} {tipo_envio} id_req {id_requisicao} value {valor_soma}")
-        cliente.sendto(mensagem_envio.encode("utf-8"), (ip_servidor, porta_destino))
-        tentativas += 1
-
+        output_queue.put(
+            f"{timestamp} server {leader[0]} {tipo_envio} "
+            f"id_req {id_requisicao} value {valor_soma}"
+        )
         try:
-            # LOOP INTERNO: Fica secando o buffer até achar o ACK certo ou dar timeout
-            while True:
-                dados_ack, endereco_ack = cliente.recvfrom(1024)
-                
-                if endereco_ack != (ip_servidor, porta_destino):
-                    continue # Volta para o topo do loop de escuta (não reenvia)
-
-                msg_ack = dados_ack.decode("utf-8")
-
-                if msg_ack == "RESET":
-                    return -1, -1  # Ordem de reset: ID volta para 1, acumulador local volta para 0
-                
-                if msg_ack.startswith("ACK,"):
-                    partes = msg_ack.split(",")
-                    id_ack = int(partes[1])
-                    
-                    if id_ack == id_requisicao:
-                        # É O PACOTE CERTO!
-                        num_reqs = int(partes[2])
-                        total_sum = int(partes[3])
-                        return num_reqs, total_sum
-                    
-                    # SE CHEGAR AQUI É PORQUE ERA UM ACK VELHO.
-                    # Não preciso re-enviar, só ignoro e continuo esperando o ACK certo ou o timeout.
-                    # O loop 'while True' interno dá a volta, lendo o próximo pacote
-        except socket.timeout:
-            pass
+            cliente.sendto(payload, leader)
+        except OSError as exc:
+            if not is_transient_network_error(exc):
+                raise
+            leader = rediscover()
+            timeouts = 0
+            continue
+        tentativas += 1
+        deadline = time.monotonic() + timeout
+        while True:
+            restante = deadline - time.monotonic()
+            if restante <= 0:
+                timeouts += 1
+                if timeouts >= 3:
+                    leader = rediscover()
+                    timeouts = 0
+                break
+            cliente.settimeout(restante)
+            try:
+                dados, endereco = cliente.recvfrom(2048)
+            except socket.timeout:
+                timeouts += 1
+                if timeouts >= 3:
+                    leader = rediscover()
+                    timeouts = 0
+                break
+            try:
+                resposta = decode(dados)
+            except ProtocolError:
+                continue
+            tipo = resposta["type"]
+            if tipo == "LEADER":
+                leader = endereco
+                continue
+            if tipo == "NOT_LEADER":
+                host = resposta.get("leader_host")
+                port = resposta.get("leader_port")
+                leader = (str(host), int(port)) if host and port else rediscover()
+                retries = 0
+                break
+            if tipo == "RETRY":
+                retries += 1
+                if retries >= 3:
+                    leader = rediscover()
+                    retries = 0
+                time.sleep(0.05)
+                break
+            if tipo == "ERROR":
+                raise RuntimeError(str(resposta.get("reason", "server rejected request")))
+            if tipo != "CLIENT_ACK":
+                continue
+            if resposta.get("client_id") != client_id:
+                continue
+            ack_id = int(resposta["request_id"])
+            if ack_id != id_requisicao:
+                continue
+            retries = 0
+            return int(resposta["num_reqs"]), int(resposta["total_sum"]), endereco

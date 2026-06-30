@@ -1,122 +1,234 @@
-# INF01085 - Relatório do Trabalho Prático 1
+# Serviço Distribuído de Soma com Replicação Passiva
 
-- Nomes: Eduardo Fonseca da Silva, Estevan Zanetti Küster
+Implementação em Python 3 de um serviço de soma sobre UDP com:
 
-## 1. Visão geral
+- entrega lógica exatamente uma vez por `(client_id, request_id)`;
+- replicação passiva para todos os servidores ativos;
+- descoberta autônoma por broadcast;
+- entrada e saída dinâmica de clientes e servidores;
+- eleição de líder pelo algoritmo do Valentão (Bully);
+- sincronização por snapshots fragmentados e verificados com SHA-256.
 
-Este trabalho implementa um serviço cliente-servidor sobre o protocolo UDP. Como o UDP não oferece confiança, a solução foi projetada com um protocolo de aplicação para garantir um comportamento confiável. A confiabilidade foi implementada com um mecanismo Stop-and-Wait com controle de sequência, garantindo tolerância a perdas, duplicatas e reordenação de pacotes.
+> A especificação Parte 2 fornecida pede C/C++. Esta implementação permanece em
+> Python por decisão explícita do projeto.
 
+## Arquitetura
 
-## 2. Implementação de cada subserviço
+Cada cliente cria um UUID novo ao iniciar e envia uma requisição por vez. Em
+caso de perda, eleição ou troca de líder, ele retransmite o mesmo UUID,
+identificador e valor. O novo líder responde com o ACK previamente replicado ou
+processa a operação uma única vez.
 
-### 2.1 Subserviço de descoberta
+Os servidores começam no estado `JOINING` e anunciam sua presença por UDP
+broadcast. O maior `server-id` conhecido inicia como líder. Um servidor que
+entra depois recebe um snapshot completo antes de se tornar `ACTIVE`. Caso seu
+ID seja maior, ele inicia uma eleição Bully após a sincronização.
 
-**Cliente (`client/discovery.py`)**: O cliente utiliza um socket configurado para permitir envio em broadcast (`SO_BROADCAST`). Ele envia a mensagem `DESCOBERTA` para a porta informada e entra em estado de espera bloqueante (com timeout).
+O líder aplica cada nova soma em uma seção crítica, atribui uma versão global e
+aguarda o ACK de todos os backups ativos antes de responder ao cliente. Durante
+eleições e sincronizações, novas escritas recebem `RETRY` e os clientes mantêm a
+requisição pendente.
 
-**Servidor (`server/processing.py`)**: Ao receber o datagrama de `DESCOBERTA`, o servidor extrai o IP e a porta de origem via `recvfrom` e responde diretamente com a mensagem `IP_SERVIDOR_OK`. Neste momento, o servidor registra o novo cliente na estrutura `state.estado_clientes`.
+O estado replicado inclui:
 
-### 2.2 Subserviço de processamento
+- quantidade global de requisições e soma total;
+- versão global do estado;
+- termo de eleição e versão de membership;
+- último request e último ACK de cada UUID cliente;
+- último endereço conhecido de cada cliente.
 
-**Cliente (`client/processing.py`)**: Utiliza o protocolo stop-and-wait. A função empacota o envio no formato `id_req,valor`, envia e aguarda o ACK correspondente antes de liberar o próximo envio.
+## Requisitos e rede
 
-**Servidor (`server/processing.py`)**: O servidor valida o `id_req` recebido comparando ele com o próximo ID esperado daquele cliente específico:
+- Python 3.10 ou mais recente;
+- Linux/Unix;
+- clientes e servidores no mesmo domínio de broadcast;
+- um endereço IP distinto por servidor.
 
-- **Comportamento ideal**: Se o ID é o esperado, processa a soma e responde com um ACK atualizado.
-- **Duplicatas**: Se `id < esperado`, é um pacote duplicado (provavelmente o ACK anterior se perdeu). Nesse caso, reenvia-se o ACK com o último estado válido para destravar o cliente.
-- **Reordenação**: Se `id > esperado`, o pacote chegou fora de ordem. O servidor descarta o processamento e envia um ACK com o último estado conhecido.
-- **(`RESET`)**: Caso o servidor seja reiniciado, ele perde todas as informações dos clientes porque ele não guarda as informações em disco (e nem deve guardar). Por isso, foi desenvolvido um tratamento para este caso. Se um cliente desconhecido tentar enviar um pacote com `id > 1`, o servidor envia uma mensagem de `RESET`, forçando o cliente a reiniciar sua contagem (`id_req = 1`). Então o cliente manda a mensagem novamente com `id_req = 1` e a soma acumulada também será reiniciada a partir da resposta do servidor.
+Servidores reais devem executar em máquinas ou interfaces IP distintas. Vários
+processos associados ao mesmo IP e à mesma porta UDP não têm identidade de rede
+distinta e o kernel pode distribuir datagramas entre eles. O benchmark usa IPs
+loopback distintos, uma porta de serviço comum e um relay UDP apenas para
+descoberta e anúncios de cluster.
 
-### 2.3 Subserviço de interface
+Partições de rede estão fora do modelo de falhas. Perda, duplicação, atraso,
+reordenação, crash e retorno de processos são tolerados desde que os servidores
+ativos voltem a se comunicar. O estado existe somente em memória; portanto,
+pelo menos um servidor sincronizado deve permanecer ativo.
 
-**Cliente (`client/interface.py`)**: Utiliza threads separadas para entrada de dados (teclado) e lógica de rede/saída, garantindo que o cliente não bloqueie a leitura de novos inputs do usuário enquanto aguarda um ACK. Os logs exibem timestamps e campos de protocolo.
+## Execução
 
-**Servidor (`server/interface.py`)**: Mantém a exibição em tempo real do estado de processamento (`num_reqs` e `total_sum`) e de anomalias na rede (duplicatas, fora de ordem).
-
-## 3. Áreas com necessidade de sincronização de dados
-
-### 3.1 Sincronização local (concorrência em memória)
-
-**Cliente (produtor-consumidor via `Queue`)**: O cliente possui uma thread bloqueada aguardando a entrada do usuário (`stdin`) e outra dedicada ao laço principal de rede. A área crítica aqui é a passagem da mensagem digitada para a thread de envio. A sincronização de dados foi resolvida utilizando a estrutura `Queue` nativa da linguagem. Como a `Queue` já implementa locks internos, eliminou-se a necessidade de gerenciar mutexes manualmente.
-
-**Servidor (isolamento por single-thread)**: A decisão foi implementar o servidor com um loop de eventos single-thread.
-
-### 3.2 Sincronização distribuída (consistência inter-processos)
-
-**Sincronização de estado (cliente <-> servidor)**: Como os processos não compartilham memória e o UDP não garante ordem, foi necessário sincronizar o estado lógico da aplicação. A área de código que garante isso é a validação do `id_requisicao` no cliente com o `id_esperado` no servidor explicada anteriormente. Essa sincronização lógica garante que o servidor só adicione o valor ao `acumulador_global` se houver um consenso de que aquele pacote é, de fato, o próximo da fila.
-
-## 4. Principais estruturas e funções implementadas
-
-### Estruturas de estado (`server/state.py`)
-
-- **`ServerState`**: Estrutura global que centraliza a fonte de verdade do servidor. Armazena as métricas globais (`num_requisicoes_total` e `acumulador_global`) e um dicionário `estado_clientes` que mapeia cada cliente ativo (endereço IP e porta) para o seu respectivo estado.
-- **`ClientState`**: Estrutura instanciada para cada cliente único descoberto. Armazena o ID da última requisição recebida com sucesso (`last_req`), além da foto do estado do servidor naquele momento exato (`last_num_reqs`, `last_total_sum`).
-
-### Funções principais no cliente
-
-- **`descobrir_servidor`**: Gerencia a criação do socket de broadcast, envio da `DESCOBERTA` e extração do IP/porta da resposta.
-- **`enviar_valor_stop_and_wait`**: Encapsula a lógica de formatação da mensagem, envio `sendto` e o loop de recebimento bloqueante com `settimeout` para gerenciar retransmissões.
-- **`executar_loop_principal`**: Consome a fila de inputs do usuário e coordena as chamadas sequenciais para a função de envio, controlando o incremento do `id_req`.
-
-### Funções principais no servidor
-
-- **`executar_loop_servidor`**: O laço principal (`while True`) que atua como listener bloqueante em `recvfrom`, roteando mensagens de descoberta ou processamento.
-- **`handle_descoberta`**: Processa novos clientes, os registra na tabela de estado interno e despacha o `IP_SERVIDOR_OK`.
-- **`handle_processamento`**: Executa a validação crítica de protocolo (checagem de sequência, processamento da soma, detecção de falhas de ordem) e empacota/envia os ACKs e RESETs.
-
-## 5. Uso das primitivas de comunicação inter-processos
-
-As primitivas de IPC basearam-se puramente na API de Sockets Berkeley:
-
-- **Criação de sockets**: Uso de `AF_INET` para endereçamento IPv4 e `SOCK_DGRAM` indicando o uso do protocolo de transporte UDP.
-- **Opções de socket**: Uso de `setsockopt` com a flag `SO_BROADCAST` no cliente para habilitar o envio da mensagem de descoberta para a máscara `255.255.255.255`.
-- **Troca de mensagens**: Uso de `sendto` e `recvfrom`.
-- **Temporização (timeout)**: Como o UDP não reporta perdas, a primitiva `settimeout` foi aplicada ao socket do cliente. Esta primitiva levanta uma exceção nativa no nível do sistema operacional caso a chamada do sistema (`syscall`) de recebimento expire, servindo de gatilho para a retransmissão de pacotes.
-
-## 6. Problemas encontrados e soluções
-
-### 6.1 Acúmulo de ACKs antigos (buffer drain)
-
-**Problema**: Foi notado que, em redes com alta latência, quando um cliente retransmitia um pacote por timeout e, logo em seguida, dois ACKs chegavam, o segundo ACK (que estava atrasado) ficava preso no buffer do sistema operacional. Na requisição seguinte, a primitiva `recvfrom` lia imediatamente este ACK antigo, causando dessincronização e novas retransmissões indevidas.
-
-**Solução**: Implementou-se um mecanismo de drain (drenagem) dentro de `enviar_valor_stop_and_wait`. O loop interno lê a resposta e extrai o ID que o ACK confirma. Se não for igual ao ID atual do envio, o pacote é ativamente descartado e o socket continua escutando. A retransmissão só ocorre se o timeout do socket estourar.
-
-### 6.2 Perda de contexto por queda do servidor
-
-**Problema**: O modelo de falha clássico onde o servidor sofre crash e volta ao ar. A especificação não detalhava o procedimento de recuperação. O cliente, sem saber da queda, enviava seu próximo valor com `id_req = 5`, mas o servidor recém-reiniciado esperava `id_req = 1`, causando um deadlock pois o servidor enxergava como pacote fora de ordem e o cliente ficava em loop de retransmissão.
-
-**Solução**: Adição da mensagem de controle `RESET`. Se o servidor identifica uma tupla de cliente desconhecida na memória cujo `id_req` seja maior que 1, ele infere que houve uma perda de memória e responde com `RESET`. O cliente processa esse comando e reinicia sua sequência.
-
-### 6.3 Resolução de ambiguidade de clientes
-
-**Problema**: No início, clientes eram identificados apenas pelo endereço IP. No entanto, se o avaliador rodasse múltiplas instâncias do cliente na mesma máquina física (mesmo localhost ou mesma rede NAT), o servidor não conseguiria distinguir as requisições.
-
-**Solução**: O dicionário `estado_clientes` foi refatorado para utilizar a tupla completa `(IP, Porta_Origem)` gerada pelo sistema operacional no `recvfrom` como chave única de identificação. Para manter tudo na especificação de logs exigida, a camada de interface formata as saídas imprimindo apenas o IP.
-
-
-## Tutorial de uso
-
-### Pré-requisitos
-
-- Python 3 instalado.
-- Cliente e servidor na mesma rede local.
-
-### 1. Iniciar o servidor
+Inicie dois ou mais servidores na mesma porta, cada um em uma máquina:
 
 ```bash
-python server\main.py <porta para servidor>
+python3 server/main.py 4000 --server-id 10
+python3 server/main.py 4000 --server-id 20
+python3 server/main.py 4000 --server-id 30
 ```
 
-### 2. Iniciar o cliente
+`--server-id` é opcional. Sem ele, um identificador unsigned de 64 bits é
+gerado aleatoriamente. Use `--bind IP` quando a máquina possuir várias
+interfaces:
 
 ```bash
-python client\main.py <porta para o servidor>
+python3 server/main.py 4000 --server-id 20 --bind 192.168.1.20
 ```
 
-### 3. Enviar valores para soma
+Inicie qualquer quantidade de clientes:
 
-Com o cliente em execução, digite um inteiro por linha e pressione Enter.  
+```bash
+python3 client/main.py 4000
+```
 
-### 4. Encerrar execução
+Digite um inteiro positivo por linha. O cliente não altera o ID da requisição
+até receber seu ACK, mesmo que o líder falhe.
 
-- Para parar cliente/servidor: `Ctrl + C` em cada terminal.
-- Também é possível encerrar o cliente enviando EOF no terminal (tipicamente Ctrl+Z no Windows ou Ctrl+D no Linux).
+Atalhos equivalentes:
+
+```bash
+make run-server PORT=4000 SERVER_ID=10
+make run-client PORT=4000
+```
+
+## Entrada e saída de processos
+
+- **Novo cliente:** descobre apenas o líder e começa com `request_id = 1`.
+- **Saída do cliente:** `Ctrl+D` ou `Ctrl+C` envia uma notificação best-effort.
+  Seu histórico de deduplicação permanece replicado.
+- **Novo servidor:** anuncia `JOINING`, recebe snapshot e só então vira
+  `ACTIVE`.
+- **Saída de backup:** o líder remove o membro e publica o novo membership.
+- **Saída do líder:** os backups iniciam eleição e clientes repetem suas
+  requisições pendentes.
+- **Último servidor:** a primeira tentativa de encerramento é recusada. Inicie
+  outro servidor ou pressione `Ctrl+C` novamente para forçar a saída.
+
+Heartbeats são enviados a cada 500 ms. Quatro períodos sem contato disparam
+remoção ou eleição.
+
+## Protocolo
+
+Todos os datagramas usam JSON compacto com a versão `v = 2` e campo `type`.
+Datagramas são limitados a 1200 bytes. Snapshots maiores são divididos em
+fragmentos de 700 bytes, numerados e protegidos por SHA-256.
+
+Principais mensagens:
+
+- clientes: `CLIENT_DISCOVERY`, `LEADER`, `CLIENT_REQUEST`, `CLIENT_ACK`,
+  `NOT_LEADER`, `RETRY`, `CLIENT_LEAVE`;
+- membership: `SERVER_HELLO`, `JOIN_REQUEST`, `HEARTBEAT`,
+  `BACKUP_HEARTBEAT`, `MEMBERSHIP`,
+  `LEAVE`;
+- replicação: `REPLICATION`, `REPLICATION_ACK`, `SNAPSHOT_CHUNK`,
+  `SNAPSHOT_ACK`, `SNAPSHOT_REQUEST`;
+- eleição: `ELECTION`, `ELECTION_OK`, `STATE_SUMMARY_REQUEST`,
+  `STATE_SUMMARY`, `COORDINATOR`.
+
+## Testes
+
+```bash
+make test
+```
+
+A suíte verifica validação do protocolo, limites unsigned de 64 bits,
+fragmentação de snapshots, deduplicação, ordem das versões, startup com três
+servidores, perda de datagrama de replicação, falha abrupta do líder,
+retransmissão após failover e entrada de um servidor de maior prioridade.
+
+## Benchmark
+
+### Benchmark simples
+
+Com um cluster já ativo:
+
+```bash
+make benchmark PORT=4000 CLIENTS=4 REQUESTS=1000
+```
+
+O benchmark informa requisições concluídas, tempo e throughput. A criação
+literal de uma thread por requisição segue a especificação, mas possui custo
+considerável em cargas muito grandes; a replicação síncrona para todos os
+backups também privilegia correção e durabilidade sobre latência.
+
+### Geração das listas
+
+Gere quatro arquivos determinísticos com 25.000 inteiros positivos por cliente:
+
+```bash
+make benchmark-generate
+```
+
+Os arquivos são gravados em `benchmark-results/generated/`. O
+`manifest.json` contém o seed, SHA-256, quantidade e soma de cada lista, a soma
+cumulativa após cada cliente e o resultado global esperado.
+
+Parâmetros podem ser alterados:
+
+```bash
+make benchmark-generate ENTRIES=50000 SEED=123 OUTPUT_ROOT=meus-resultados
+```
+
+### Benchmark caótico completo
+
+Execute a calibração e o cenário automatizado com quatro servidores e quatro
+clientes. Cada relay, servidor e cliente é um processo independente:
+
+```bash
+make benchmark-chaos
+```
+
+O runner:
+
+1. mede o throughput limpo com quatro réplicas somente para estimar a duração;
+2. gera exatamente `ENTRIES` números por cliente em memória, 25.000 por padrão;
+3. encerra os processos de calibração e inicia um cluster novo;
+4. executa falhas e retornos de backups, queda e reeleição do líder, entrada de
+   servidores de maior prioridade, operação com somente um servidor e churn de
+   zero a quatro clientes;
+5. verifica a contagem, soma, versão e tabela de deduplicação em todas as
+   réplicas finais.
+
+O cenário usa UDP real e o mesmo porto de serviço em IPs loopback distintos:
+os IDs 10–60 usam `127.0.0.10`–`127.0.0.60`. Um relay UDP opcional distribui
+somente descoberta e anúncios de cluster. Requisições, ACKs, replicação,
+snapshots, heartbeats e eleição continuam sendo tráfego UDP direto. Em várias
+máquinas, use IPs reais e aponte `--discovery` para o endereço do relay.
+
+Configuração típica:
+
+```bash
+make benchmark-chaos \
+  ENTRIES=25000 \
+  TARGET_DURATION=240 \
+  SEED=20260613 \
+  BASE_PORT=47000
+```
+
+Para validar rapidamente a instalação:
+
+```bash
+make benchmark-chaos-quick
+```
+
+Cada execução cria `benchmark-results/chaos-<data>-<id>/` contendo:
+
+- `config.json`;
+- logs separados por geração de relay, servidor e cliente;
+- `processes.json` com PID, comando, geração, sinal e código de saída;
+- `timeline.jsonl` com joins, leaves, eleições e assertions;
+- `samples.jsonl` com status UDP, throughput e quantidades ativas;
+- `status_snapshots.jsonl` com as respostas UDP completas de clientes e
+  servidores;
+- `report.json` com duração projetada/real, `PASSED` ou `FAILED` e o estado
+  final completo.
+
+O runner registra um aviso aos 270 segundos caso ainda esteja executando, mas
+continua até verificar a soma. `SIGTERM` pausa clientes após o ACK corrente e
+faz servidores saírem graciosamente; `SIGKILL` simula falha abrupta. Clientes
+reiniciados recebem identidade, posição e requisição pendente do estado em
+memória observado por UDP pelo orquestrador. Nenhum arquivo é lido durante o
+benchmark para restaurar estado ou trocar dados entre processos; os arquivos
+do diretório de resultados são somente logs e relatórios de saída.
+
+Uma execução de referência com 100.000 operações terminou em 133 segundos,
+sem aviso de duração, e validou a soma esperada em todas as quatro réplicas
+finais.

@@ -1,76 +1,52 @@
-import socket
-from datetime import datetime
-
-from processing import handle_descoberta, handle_processamento
-from state import ServerState
-
-
-def configurar_servidor(porta: int) -> tuple[socket.socket, ServerState]:
-    """
-    Cria o socket do servidor.
-
-    socket.AF_INET: Define a Família de Endereços (Address Family). 
-    O AF_INET diz que vamos usar endereços IPv4. 
-    Se fosse IPv6, usaria AF_INET6
-    
-    socket.SOCK_DGRAM: Define o Tipo de Socket. SOCK_DGRAM significa Datagrama. 
-    Na prática, significa "Quero usar o protocolo UDP". 
-    (Se fôssemos usar o protocolo TCP seria socket.SOCK_STREAM).
-    """
-    servidor = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+try:
+    from .node import ServerNode
+except ImportError:
+    from node import ServerNode
+import signal
 
 
-    """
-    Permite reutilizar o endereço.
+def iniciar_servidor(
+    porta: int,
+    server_id: int,
+    bind_host: str = "",
+    discovery_address: tuple[str, int] | None = None,
+    request_logging: bool = True,
+) -> None:
+    node = ServerNode(
+        porta,
+        server_id,
+        bind_host,
+        discovery_address=discovery_address,
+        request_logging=request_logging,
+    )
+    terminating = False
 
-    Quando para o seu servidor (apertando Ctrl+C, por exemplo) e tenta rodar o script de novo logo em seguida, 
-    o sistema operacional às vezes mantém a porta "presa" por alguns segundos achando que ainda há pacotes 
-    perdidos a caminho.
+    def handle_sigterm(_signum, _frame) -> None:
+        nonlocal terminating
+        if terminating:
+            node.stop(graceful=False, force=True)
+            return
+        terminating = True
+        if not node.stop(graceful=True):
+            terminating = False
 
-    setsockopt: Significa "Set Socket Options" (Configurar Opções do Socket).
-    socket.SOL_SOCKET: Diz que a configuração que vamos fazer é a nível geral do socket.
-    socket.SO_REUSEADDR: Essa é a regra em si. Significa "Socket Option: Reuse Address" 
-    (Permitir o reúso imediato do endereço e porta).
-    1: É o valor booleano True. Estamos ativando essa opção. Com isso, mesmo que a porta 
-    não tenha sido liberada 100% pelo Windows/Linux, o seu script pode "roubá-la" de volta 
-    imediatamente ao reiniciar.
-    """
-    servidor.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    servidor.bind(("", porta))
-
-    servidor.settimeout(1.0)
-    
-    state = ServerState()
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"{timestamp} num_reqs {state.num_requisicoes_total} total_sum {state.acumulador_global}")
-    return servidor, state
-
-
-def executar_loop_servidor(servidor: socket.socket, state: ServerState) -> None:
-
+    signal.signal(signal.SIGTERM, handle_sigterm)
     try:
-        while True:
-            try:
-                dados, endereco_cliente = servidor.recvfrom(1024)
-                mensagem = dados.decode("utf-8")
-
-                if mensagem == "DESCOBERTA":
-                    handle_descoberta(servidor, endereco_cliente, state)
-                else:
-                    handle_processamento(servidor, endereco_cliente, mensagem, state)
-
-            except socket.timeout:
-                pass
+        node.serve_forever()
     except KeyboardInterrupt:
-        print("\n[!] Interrupção de teclado detectada.")
-        
+        if not node.stop(graceful=True):
+            print(
+                "Encerramento adiado para preservar o cluster. "
+                "Inicie outro servidor ou pressione Ctrl+C novamente para forçar.",
+                flush=True,
+            )
+            try:
+                while node.running.is_set():
+                    import time
 
-
-
-def iniciar_servidor(porta: int) -> None:
-    servidor, state = configurar_servidor(porta)
-
-    try:
-        executar_loop_servidor(servidor, state)
+                    time.sleep(0.2)
+            except KeyboardInterrupt:
+                node.stop(graceful=False, force=True)
     finally:
-        servidor.close()
+        if node.running.is_set():
+            node.stop(graceful=False, force=True)
